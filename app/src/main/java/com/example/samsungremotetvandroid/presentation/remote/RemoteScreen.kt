@@ -12,6 +12,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextAlign
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.samsungremotetvandroid.core.design.SamsungSpacing
@@ -71,31 +72,84 @@ fun RemoteScreen(
             )
         }
 
+        Text(
+            text = "D-pad",
+            style = MaterialTheme.typography.titleMedium
+        )
+
+        SecondaryActionButton(
+            text = "Up",
+            onClick = { viewModel.sendRemoteKey(RemoteKey.D_PAD_UP) }
+        )
+
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(SamsungSpacing.SpacingSm)
         ) {
             SecondaryActionButton(
-                text = "D-pad Up",
-                onClick = { viewModel.sendRemoteKey(RemoteKey.D_PAD_UP) },
+                text = "Left",
+                onClick = { viewModel.sendRemoteKey(RemoteKey.D_PAD_LEFT) },
                 modifier = Modifier.weight(1f)
             )
             SecondaryActionButton(
-                text = "Volume +",
-                onClick = { viewModel.sendRemoteKey(RemoteKey.VOLUME_UP) },
+                text = "OK",
+                onClick = { viewModel.sendRemoteKey(RemoteKey.OK) },
+                modifier = Modifier.weight(1f)
+            )
+            SecondaryActionButton(
+                text = "Right",
+                onClick = { viewModel.sendRemoteKey(RemoteKey.D_PAD_RIGHT) },
                 modifier = Modifier.weight(1f)
             )
         }
 
         SecondaryActionButton(
-            text = "Media Play/Pause",
-            onClick = { viewModel.sendRemoteKey(RemoteKey.MEDIA_PLAY_PAUSE) }
+            text = "Down",
+            onClick = { viewModel.sendRemoteKey(RemoteKey.D_PAD_DOWN) }
         )
+
+        Text(
+            text = "Volume / Media / Power",
+            style = MaterialTheme.typography.titleMedium
+        )
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(SamsungSpacing.SpacingSm)
+        ) {
+            SecondaryActionButton(
+                text = "Volume +",
+                onClick = { viewModel.sendRemoteKey(RemoteKey.VOLUME_UP) },
+                modifier = Modifier.weight(1f)
+            )
+            SecondaryActionButton(
+                text = "Volume -",
+                onClick = { viewModel.sendRemoteKey(RemoteKey.VOLUME_DOWN) },
+                modifier = Modifier.weight(1f)
+            )
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(SamsungSpacing.SpacingSm)
+        ) {
+            SecondaryActionButton(
+                text = "Play/Pause",
+                onClick = { viewModel.sendRemoteKey(RemoteKey.MEDIA_PLAY_PAUSE) },
+                modifier = Modifier.weight(1f)
+            )
+            SecondaryActionButton(
+                text = "Power",
+                onClick = { viewModel.sendRemoteKey(RemoteKey.POWER) },
+                modifier = Modifier.weight(1f)
+            )
+        }
 
         Text(
             text = "Quick Launch remains curated shortcuts, not installed-app enumeration.",
             style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Start
         )
     }
 }
