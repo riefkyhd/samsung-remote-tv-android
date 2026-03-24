@@ -52,7 +52,14 @@ fun SamsungRemoteApp() {
             modifier = Modifier.padding(innerPadding)
         ) {
             composable(AppDestination.Discovery.route) {
-                DiscoveryScreen()
+                DiscoveryScreen(
+                    onOpenRemote = {
+                        navController.navigate(AppDestination.Remote.route) {
+                            launchSingleTop = true
+                            restoreState = true
+                        }
+                    }
+                )
             }
             composable(AppDestination.Remote.route) {
                 RemoteScreen()

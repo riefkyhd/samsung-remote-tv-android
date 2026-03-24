@@ -1,5 +1,10 @@
 package com.example.samsungremotetvandroid.data.repository
 
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
 import android.util.Base64
 import com.example.samsungremotetvandroid.domain.model.ConnectionState
 import com.example.samsungremotetvandroid.domain.model.QuickLaunchShortcut
@@ -8,18 +13,24 @@ import com.example.samsungremotetvandroid.domain.model.SamsungTv
 import com.example.samsungremotetvandroid.domain.model.TvCapability
 import com.example.samsungremotetvandroid.domain.model.TvProtocol
 import com.example.samsungremotetvandroid.domain.repository.TvControlRepository
+import dagger.hilt.android.qualifiers.ApplicationContext
+import java.net.InetAddress
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -29,12 +40,25 @@ import okhttp3.WebSocketListener
 import org.json.JSONObject
 
 @Singleton
-class InMemoryTvControlRepository @Inject constructor() : TvControlRepository {
-    private val okHttpClient = OkHttpClient.Builder()
+class InMemoryTvControlRepository @Inject constructor(
+    @ApplicationContext private val context: Context
+) : TvControlRepository {
+    private val wsClient = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .build()
 
+    private val restClient = OkHttpClient.Builder()
+        .connectTimeout(2, TimeUnit.SECONDS)
+        .readTimeout(2, TimeUnit.SECONDS)
+        .writeTimeout(2, TimeUnit.SECONDS)
+        .build()
+
+    private val nsdManager by lazy {
+        context.getSystemService(Context.NSD_SERVICE) as NsdManager
+    }
+
     private val connectionMutex = Mutex()
+    private val discoveryMutex = Mutex()
 
     private val savedTvsState = MutableStateFlow(
         listOf(
@@ -43,17 +67,12 @@ class InMemoryTvControlRepository @Inject constructor() : TvControlRepository {
                 displayName = "Living Room TV",
                 ipAddress = "192.168.1.20",
                 protocol = TvProtocol.MODERN,
-                capabilities = setOf(
-                    TvCapability.D_PAD,
-                    TvCapability.VOLUME,
-                    TvCapability.MEDIA,
-                    TvCapability.POWER,
-                    TvCapability.QUICK_LAUNCH
-                )
+                capabilities = DEFAULT_CAPABILITIES
             )
         )
     )
 
+    private val discoveredTvsState = MutableStateFlow<List<SamsungTv>>(emptyList())
     private val connectionStateFlow = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
 
     private var activeTv: SamsungTv? = null
@@ -64,10 +83,64 @@ class InMemoryTvControlRepository @Inject constructor() : TvControlRepository {
     private var readyForCommands: Boolean = false
 
     override val savedTvs: StateFlow<List<SamsungTv>> = savedTvsState.asStateFlow()
+    override val discoveredTvs: StateFlow<List<SamsungTv>> = discoveredTvsState.asStateFlow()
     override val connectionState: StateFlow<ConnectionState> = connectionStateFlow.asStateFlow()
 
+    override suspend fun scanDiscovery() {
+        discoveryMutex.withLock {
+            if (!isOnWifi()) {
+                discoveredTvsState.value = emptyList()
+                return
+            }
+
+            val serviceTypes = listOf(
+                "_samsungctl._tcp.",
+                "_samsung-multiscreen._tcp."
+            )
+
+            val services = mutableListOf<NsdServiceInfo>()
+            serviceTypes.forEach { serviceType ->
+                services += discoverServices(serviceType)
+            }
+
+            val foundByIp = linkedMapOf<String, SamsungTv>()
+            services.forEach { serviceInfo ->
+                val ipAddress = resolveServiceIp(serviceInfo) ?: return@forEach
+                if (foundByIp.containsKey(ipAddress)) {
+                    return@forEach
+                }
+
+                val tv = fetchModernTvInfo(ipAddress) ?: return@forEach
+                foundByIp[ipAddress] = tv
+            }
+
+            discoveredTvsState.value = foundByIp.values.toList()
+        }
+    }
+
+    override suspend fun scanManualIp(ipAddress: String): SamsungTv {
+        val normalizedIp = ipAddress.trim()
+
+        if (!isOnWifi()) {
+            throw IllegalStateException("Connect to Wi-Fi, then try again.")
+        }
+
+        val tv = fetchModernTvInfo(normalizedIp)
+            ?: throw IllegalStateException("Could not reach a compatible Samsung TV at that IP.")
+
+        discoveredTvsState.update { existing ->
+            val withoutSameIp = existing.filterNot { it.ipAddress == tv.ipAddress }
+            listOf(tv) + withoutSameIp
+        }
+
+        return tv
+    }
+
     override suspend fun connect(tvId: String) {
-        val tv = savedTvsState.value.firstOrNull { it.id == tvId }
+        val savedTv = savedTvsState.value.firstOrNull { it.id == tvId }
+        val discoveredTv = discoveredTvsState.value.firstOrNull { it.id == tvId }
+        val tv = savedTv ?: discoveredTv
+
         if (tv == null) {
             connectionStateFlow.value = ConnectionState.Error("Unable to connect: TV not found")
             return
@@ -79,6 +152,8 @@ class InMemoryTvControlRepository @Inject constructor() : TvControlRepository {
             )
             return
         }
+
+        val shouldPersistAfterConnect = savedTv == null
 
         connectionMutex.withLock {
             shutdownActiveSocket(setDisconnected = false)
@@ -93,7 +168,7 @@ class InMemoryTvControlRepository @Inject constructor() : TvControlRepository {
                 .url(buildModernSocketUrl(tv.ipAddress))
                 .build()
 
-            activeSocket = okHttpClient.newWebSocket(
+            activeSocket = wsClient.newWebSocket(
                 request,
                 modernSocketListener(tv.id, signal)
             )
@@ -101,6 +176,10 @@ class InMemoryTvControlRepository @Inject constructor() : TvControlRepository {
             try {
                 withTimeout(CONNECTION_READY_TIMEOUT_MS) {
                     signal.await()
+                }
+
+                if (shouldPersistAfterConnect && connectionStateFlow.value is ConnectionState.Ready) {
+                    persistToSavedTvs(tv)
                 }
             } catch (_: Throwable) {
                 if (connectionStateFlow.value !is ConnectionState.Error) {
@@ -164,7 +243,13 @@ class InMemoryTvControlRepository @Inject constructor() : TvControlRepository {
 
     override suspend fun removeDevice(tvId: String) {
         val activeTvId = activeTv?.id
+        val removedIp = savedTvsState.value.firstOrNull { it.id == tvId }?.ipAddress
+
         savedTvsState.update { tvs -> tvs.filterNot { it.id == tvId } }
+
+        if (removedIp != null) {
+            discoveredTvsState.update { tvs -> tvs.filterNot { it.ipAddress == removedIp } }
+        }
 
         if (activeTvId == tvId) {
             disconnect()
@@ -181,6 +266,167 @@ class InMemoryTvControlRepository @Inject constructor() : TvControlRepository {
             tvs.map { tv ->
                 if (tv.id == tvId) tv.copy(displayName = normalizedName) else tv
             }
+        }
+    }
+
+    private suspend fun discoverServices(serviceType: String): List<NsdServiceInfo> {
+        return withContext(Dispatchers.Main) {
+            val found = mutableListOf<NsdServiceInfo>()
+            val completed = CompletableDeferred<List<NsdServiceInfo>>()
+
+            val listener = object : NsdManager.DiscoveryListener {
+                override fun onDiscoveryStarted(regType: String) = Unit
+
+                override fun onServiceFound(service: NsdServiceInfo) {
+                    found += service
+                }
+
+                override fun onServiceLost(service: NsdServiceInfo) = Unit
+
+                override fun onDiscoveryStopped(serviceType: String) {
+                    if (!completed.isCompleted) {
+                        completed.complete(found.toList())
+                    }
+                }
+
+                override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
+                    runCatching { nsdManager.stopServiceDiscovery(this) }
+                    if (!completed.isCompleted) {
+                        completed.complete(emptyList())
+                    }
+                }
+
+                override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {
+                    runCatching { nsdManager.stopServiceDiscovery(this) }
+                    if (!completed.isCompleted) {
+                        completed.complete(found.toList())
+                    }
+                }
+            }
+
+            val started = runCatching {
+                nsdManager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD, listener)
+            }.isSuccess
+
+            if (!started) {
+                return@withContext emptyList()
+            }
+
+            val timeoutJob = launch {
+                delay(DISCOVERY_SCAN_TIMEOUT_MS)
+                runCatching { nsdManager.stopServiceDiscovery(listener) }
+                if (!completed.isCompleted) {
+                    completed.complete(found.toList())
+                }
+            }
+
+            val result = completed.await()
+            timeoutJob.cancel()
+            result
+        }
+    }
+
+    private suspend fun resolveServiceIp(serviceInfo: NsdServiceInfo): String? {
+        return withContext(Dispatchers.Main) {
+            val completed = CompletableDeferred<String?>()
+
+            val listener = object : NsdManager.ResolveListener {
+                override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                    if (!completed.isCompleted) {
+                        completed.complete(null)
+                    }
+                }
+
+                override fun onServiceResolved(resolvedServiceInfo: NsdServiceInfo) {
+                    val normalizedIp = normalizeIpv4(resolvedServiceInfo.host?.hostAddress)
+                    if (!completed.isCompleted) {
+                        completed.complete(normalizedIp)
+                    }
+                }
+            }
+
+            val started = runCatching {
+                nsdManager.resolveService(serviceInfo, listener)
+            }.isSuccess
+
+            if (!started) {
+                return@withContext null
+            }
+
+            try {
+                withTimeout(RESOLVE_TIMEOUT_MS) {
+                    completed.await()
+                }
+            } catch (_: Throwable) {
+                null
+            }
+        }
+    }
+
+    private suspend fun fetchModernTvInfo(ipAddress: String): SamsungTv? {
+        val normalizedIp = normalizeIpv4(ipAddress) ?: return null
+
+        return withContext(Dispatchers.IO) {
+            val request = Request.Builder()
+                .url("http://$normalizedIp:8001/api/v2/")
+                .build()
+
+            val response = runCatching {
+                restClient.newCall(request).execute()
+            }.getOrNull() ?: return@withContext null
+
+            response.use {
+                if (!response.isSuccessful) {
+                    return@withContext null
+                }
+
+                val body = response.body?.string().orEmpty()
+                if (body.isBlank()) {
+                    return@withContext null
+                }
+
+                val payload = runCatching { JSONObject(body) }.getOrNull()
+                    ?: return@withContext null
+                val device = payload.optJSONObject("device")
+                    ?: return@withContext null
+
+                val deviceName = device.optString("name").ifBlank { "Samsung TV" }
+                val modelName = device.optString("modelName").ifBlank { "Samsung TV" }
+                val displayName = if (deviceName.equals("Samsung TV", ignoreCase = true)) {
+                    modelName
+                } else {
+                    deviceName
+                }
+
+                SamsungTv(
+                    id = tvIdForIp(normalizedIp),
+                    displayName = displayName,
+                    ipAddress = normalizedIp,
+                    protocol = TvProtocol.MODERN,
+                    capabilities = DEFAULT_CAPABILITIES
+                )
+            }
+        }
+    }
+
+    private fun persistToSavedTvs(tv: SamsungTv) {
+        savedTvsState.update { current ->
+            val existingIndex = current.indexOfFirst {
+                it.id == tv.id || it.ipAddress == tv.ipAddress
+            }
+
+            if (existingIndex >= 0) {
+                current.toMutableList().apply {
+                    val existing = this[existingIndex]
+                    this[existingIndex] = tv.copy(id = existing.id)
+                }
+            } else {
+                current + tv
+            }
+        }
+
+        discoveredTvsState.update { current ->
+            current.filterNot { it.ipAddress == tv.ipAddress }
         }
     }
 
@@ -314,13 +560,51 @@ class InMemoryTvControlRepository @Inject constructor() : TvControlRepository {
         }.getOrNull()
     }
 
+    private fun isOnWifi(): Boolean {
+        val manager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val network = manager.activeNetwork ?: return false
+        val capabilities = manager.getNetworkCapabilities(network) ?: return false
+
+        return capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+    }
+
+    private fun normalizeIpv4(rawAddress: String?): String? {
+        val candidate = rawAddress?.substringBefore('%')?.trim().orEmpty()
+        if (candidate.isBlank()) {
+            return null
+        }
+
+        val parsed = runCatching { InetAddress.getByName(candidate) }.getOrNull() ?: return null
+        val normalized = parsed.hostAddress?.substringBefore('%') ?: return null
+
+        return if (normalized.contains(':')) {
+            null
+        } else {
+            normalized
+        }
+    }
+
+    private fun tvIdForIp(ipAddress: String): String {
+        return "tv-" + ipAddress.replace('.', '-')
+    }
+
     companion object {
         private const val CONNECTION_READY_TIMEOUT_MS = 6_000L
+        private const val DISCOVERY_SCAN_TIMEOUT_MS = 4_500L
+        private const val RESOLVE_TIMEOUT_MS = 1_500L
         private const val MODERN_CLIENT_NAME = "Samsung Remote TV Android"
 
         private const val EVENT_CHANNEL_CONNECT = "ms.channel.connect"
         private const val EVENT_CHANNEL_READY = "ms.channel.ready"
         private const val EVENT_CHANNEL_UNAUTHORIZED = "ms.channel.unauthorized"
+
+        private val DEFAULT_CAPABILITIES = setOf(
+            TvCapability.D_PAD,
+            TvCapability.VOLUME,
+            TvCapability.MEDIA,
+            TvCapability.POWER,
+            TvCapability.QUICK_LAUNCH
+        )
     }
 }
 

@@ -8,8 +8,11 @@ import kotlinx.coroutines.flow.StateFlow
 
 interface TvControlRepository {
     val savedTvs: StateFlow<List<SamsungTv>>
+    val discoveredTvs: StateFlow<List<SamsungTv>>
     val connectionState: StateFlow<ConnectionState>
 
+    suspend fun scanDiscovery()
+    suspend fun scanManualIp(ipAddress: String): SamsungTv
     suspend fun connect(tvId: String)
     suspend fun disconnect()
     suspend fun sendRemoteKey(key: RemoteKey)

@@ -14,10 +14,28 @@ class ObserveSavedTvsUseCase @Inject constructor(
     operator fun invoke(): StateFlow<List<SamsungTv>> = repository.savedTvs
 }
 
+class ObserveDiscoveredTvsUseCase @Inject constructor(
+    private val repository: TvControlRepository
+) {
+    operator fun invoke(): StateFlow<List<SamsungTv>> = repository.discoveredTvs
+}
+
 class ObserveConnectionStateUseCase @Inject constructor(
     private val repository: TvControlRepository
 ) {
     operator fun invoke(): StateFlow<ConnectionState> = repository.connectionState
+}
+
+class ScanDiscoveryUseCase @Inject constructor(
+    private val repository: TvControlRepository
+) {
+    suspend operator fun invoke() = repository.scanDiscovery()
+}
+
+class ScanManualIpUseCase @Inject constructor(
+    private val repository: TvControlRepository
+) {
+    suspend operator fun invoke(ipAddress: String): SamsungTv = repository.scanManualIp(ipAddress)
 }
 
 class ConnectToTvUseCase @Inject constructor(

@@ -3,4 +3,24 @@
     <string name="nav_discovery">Discovery</string>
     <string name="nav_remote">Remote</string>
     <string name="nav_settings">Settings</string>
+    <string name="discovery_title">Discovery</string>
+    <string name="discovery_intro">Saved and discovered TVs are shown separately. Add Manually if your TV is not listed.</string>
+    <string name="discovery_scan_network">Scan Network</string>
+    <string name="discovery_scanning">Scanning&#8230;</string>
+    <string name="discovery_scanning_detail">Scanning your local network&#8230;</string>
+    <string name="discovery_add_manually">Add Manually</string>
+    <string name="discovery_no_tvs_title">No TVs Found</string>
+    <string name="discovery_no_tvs_description">Ensure your phone and TV are on the same Wi-Fi.</string>
+    <string name="discovery_saved_section">Saved TVs</string>
+    <string name="discovery_no_saved">No saved TVs yet.</string>
+    <string name="discovery_discovered_section">Discovered TVs</string>
+    <string name="discovery_no_new">No new TVs found on this scan.</string>
+    <string name="discovery_manual_title">Add TV by IP</string>
+    <string name="discovery_manual_ip_label">IP Address</string>
+    <string name="discovery_manual_ip_placeholder">192.168.1.20</string>
+    <string name="common_open">Open</string>
+    <string name="common_connect">Connect</string>
+    <string name="common_cancel">Cancel</string>
+    <string name="common_error">Error</string>
+    <string name="common_ok">OK</string>
 </resources>
