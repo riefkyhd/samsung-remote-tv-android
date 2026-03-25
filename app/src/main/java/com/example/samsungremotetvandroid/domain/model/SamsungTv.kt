@@ -5,7 +5,9 @@ data class SamsungTv(
     val displayName: String,
     val ipAddress: String,
     val protocol: TvProtocol,
-    val capabilities: Set<TvCapability>
+    val capabilities: Set<TvCapability>,
+    val modelName: String = "",
+    val macAddress: String = ""
 )
 
 enum class TvProtocol {

@@ -6,6 +6,8 @@ import com.example.samsungremotetvandroid.core.diagnostics.DiagnosticsCategory
 import com.example.samsungremotetvandroid.core.diagnostics.DiagnosticsTracker
 import com.example.samsungremotetvandroid.domain.model.ConnectionState
 import com.example.samsungremotetvandroid.domain.model.RemoteKey
+import com.example.samsungremotetvandroid.domain.usecase.CancelEncryptedPairingUseCase
+import com.example.samsungremotetvandroid.domain.usecase.CompleteEncryptedPairingUseCase
 import com.example.samsungremotetvandroid.domain.usecase.ConnectToTvUseCase
 import com.example.samsungremotetvandroid.domain.usecase.DisconnectFromTvUseCase
 import com.example.samsungremotetvandroid.domain.usecase.ObserveConnectionStateUseCase
@@ -15,6 +17,8 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import javax.inject.Inject
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -25,6 +29,8 @@ class RemoteViewModel @Inject constructor(
     private val observeConnectionStateUseCase: ObserveConnectionStateUseCase,
     private val observeSavedTvsUseCase: ObserveSavedTvsUseCase,
     private val connectToTvUseCase: ConnectToTvUseCase,
+    private val completeEncryptedPairingUseCase: CompleteEncryptedPairingUseCase,
+    private val cancelEncryptedPairingUseCase: CancelEncryptedPairingUseCase,
     private val disconnectFromTvUseCase: DisconnectFromTvUseCase,
     private val sendRemoteKeyUseCase: SendRemoteKeyUseCase,
     private val diagnosticsTracker: DiagnosticsTracker
@@ -32,9 +38,11 @@ class RemoteViewModel @Inject constructor(
     val connectionState = observeConnectionStateUseCase()
     val savedTvs = observeSavedTvsUseCase()
     private val connectAttemptsFlow = MutableStateFlow(0)
+    private val pendingPinFlow = MutableStateFlow("")
 
     val diagnosticsEvents = diagnosticsTracker.recentEvents
     val lastErrorSummary = diagnosticsTracker.lastErrorSummary
+    val pendingPin: StateFlow<String> = pendingPinFlow.asStateFlow()
     val diagnosticsSummary = combine(
         connectionState,
         savedTvs,
@@ -105,10 +113,59 @@ class RemoteViewModel @Inject constructor(
         }
     }
 
+    fun updatePendingPin(value: String) {
+        pendingPinFlow.value = value
+    }
+
+    fun submitEncryptedPin() {
+        val state = connectionState.value as? ConnectionState.PinRequired ?: run {
+            diagnosticsTracker.recordError(
+                context = "submit_encrypted_pin",
+                errorMessage = "pin submission ignored because pin-required state is not active"
+            )
+            return
+        }
+
+        val pin = pendingPinFlow.value.trim()
+        viewModelScope.launch {
+            runCatching {
+                completeEncryptedPairingUseCase(
+                    tvId = state.tvId,
+                    pin = pin
+                )
+                pendingPinFlow.value = ""
+            }.onFailure { error ->
+                diagnosticsTracker.recordError(
+                    context = "submit_encrypted_pin",
+                    errorMessage = error.message ?: "failed to complete encrypted pairing",
+                    metadata = mapOf("tvId" to state.tvId)
+                )
+            }
+        }
+    }
+
+    fun cancelEncryptedPairing() {
+        val state = connectionState.value as? ConnectionState.PinRequired ?: return
+        viewModelScope.launch {
+            runCatching {
+                cancelEncryptedPairingUseCase(state.tvId)
+                pendingPinFlow.value = ""
+            }.onFailure { error ->
+                diagnosticsTracker.recordError(
+                    context = "cancel_encrypted_pairing",
+                    errorMessage = error.message ?: "failed to cancel encrypted pairing",
+                    metadata = mapOf("tvId" to state.tvId)
+                )
+            }
+        }
+    }
+
     private fun connectionStateLabel(state: ConnectionState): String {
         return when (state) {
             ConnectionState.Disconnected -> "Disconnected"
             ConnectionState.Connecting -> "Connecting"
+            is ConnectionState.Pairing -> "Pairing"
+            is ConnectionState.PinRequired -> "Pin Required"
             is ConnectionState.ConnectedNotReady -> "Connected (Not Ready)"
             is ConnectionState.Ready -> "Ready"
             is ConnectionState.Error -> "Error"

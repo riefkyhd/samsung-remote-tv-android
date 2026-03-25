@@ -5,6 +5,16 @@ sealed interface ConnectionState {
 
     data object Connecting : ConnectionState
 
+    data class Pairing(
+        val tvId: String,
+        val countdownSeconds: Int
+    ) : ConnectionState
+
+    data class PinRequired(
+        val tvId: String,
+        val countdownSeconds: Int
+    ) : ConnectionState
+
     data class ConnectedNotReady(
         val tvId: String
     ) : ConnectionState

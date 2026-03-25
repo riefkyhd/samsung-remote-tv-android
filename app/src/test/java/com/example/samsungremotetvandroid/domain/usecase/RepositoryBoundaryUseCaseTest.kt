@@ -78,6 +78,10 @@ private class FakeTvControlRepository : TvControlRepository {
 
     override suspend fun connect(tvId: String) = Unit
 
+    override suspend fun completeEncryptedPairing(tvId: String, pin: String) = Unit
+
+    override suspend fun cancelEncryptedPairing(tvId: String) = Unit
+
     override suspend fun disconnect() = Unit
 
     override suspend fun sendRemoteKey(key: RemoteKey) = Unit

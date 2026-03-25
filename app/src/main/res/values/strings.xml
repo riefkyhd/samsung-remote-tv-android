@@ -39,4 +39,9 @@
     <string name="remote_diagnostics_last_error">Last Error: %1$s</string>
     <string name="remote_diagnostics_none">none</string>
     <string name="remote_diagnostics_empty">No diagnostics yet.</string>
+    <string name="remote_pin_title">Enter TV PIN</string>
+    <string name="remote_pin_help">Legacy encrypted pairing requires the PIN shown on your TV.</string>
+    <string name="remote_pin_label">TV PIN</string>
+    <string name="remote_pin_submit">Submit PIN</string>
+    <string name="remote_pin_cancel">Cancel Pairing</string>
 </resources>

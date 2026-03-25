@@ -7,8 +7,10 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -16,6 +18,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -34,6 +37,7 @@ fun RemoteScreen(
     val diagnosticsSummary by viewModel.diagnosticsSummary.collectAsStateWithLifecycle()
     val diagnosticsEvents by viewModel.diagnosticsEvents.collectAsStateWithLifecycle()
     val lastErrorSummary by viewModel.lastErrorSummary.collectAsStateWithLifecycle()
+    val pendingPin by viewModel.pendingPin.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val isDebuggable = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
 
@@ -80,6 +84,48 @@ fun RemoteScreen(
                 onClick = viewModel::disconnect,
                 modifier = Modifier.weight(1f)
             )
+        }
+
+        if (connectionState is ConnectionState.PinRequired) {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(
+                    modifier = Modifier.padding(SamsungSpacing.SpacingMd),
+                    verticalArrangement = Arrangement.spacedBy(SamsungSpacing.SpacingSm)
+                ) {
+                    Text(
+                        text = stringResource(id = R.string.remote_pin_title),
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Text(
+                        text = stringResource(id = R.string.remote_pin_help),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    OutlinedTextField(
+                        value = pendingPin,
+                        onValueChange = viewModel::updatePendingPin,
+                        label = { Text(text = stringResource(id = R.string.remote_pin_label)) },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                        singleLine = true
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(SamsungSpacing.SpacingSm)
+                    ) {
+                        PrimaryActionButton(
+                            text = stringResource(id = R.string.remote_pin_submit),
+                            onClick = viewModel::submitEncryptedPin,
+                            modifier = Modifier.weight(1f)
+                        )
+                        SecondaryActionButton(
+                            text = stringResource(id = R.string.remote_pin_cancel),
+                            onClick = viewModel::cancelEncryptedPairing,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+            }
         }
 
         Text(
@@ -212,6 +258,8 @@ private fun connectionStateLabel(state: ConnectionState): String {
     return when (state) {
         ConnectionState.Disconnected -> "Disconnected"
         ConnectionState.Connecting -> "Connecting"
+        is ConnectionState.Pairing -> "Pairing (${state.countdownSeconds}s)"
+        is ConnectionState.PinRequired -> "Pin Required (${state.countdownSeconds}s)"
         is ConnectionState.ConnectedNotReady -> "Connected (Not Ready)"
         is ConnectionState.Ready -> "Ready"
         is ConnectionState.Error -> "Error: ${state.message}"

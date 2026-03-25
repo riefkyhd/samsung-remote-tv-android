@@ -14,6 +14,8 @@ interface TvControlRepository {
     suspend fun scanDiscovery()
     suspend fun scanManualIp(ipAddress: String): SamsungTv
     suspend fun connect(tvId: String)
+    suspend fun completeEncryptedPairing(tvId: String, pin: String)
+    suspend fun cancelEncryptedPairing(tvId: String)
     suspend fun disconnect()
     suspend fun sendRemoteKey(key: RemoteKey)
     suspend fun launchQuickLaunchApp(tvId: String, shortcut: QuickLaunchShortcut)

@@ -8,6 +8,10 @@ import android.net.nsd.NsdServiceInfo
 import android.util.Base64
 import com.example.samsungremotetvandroid.core.diagnostics.DiagnosticsCategory
 import com.example.samsungremotetvandroid.core.diagnostics.DiagnosticsTracker
+import com.example.samsungremotetvandroid.data.legacy.LegacyEncryptedSessionCoordinator
+import com.example.samsungremotetvandroid.data.storage.SensitivePairingStorage
+import com.example.samsungremotetvandroid.data.storage.SpcCredentials
+import com.example.samsungremotetvandroid.data.storage.SpcVariants
 import com.example.samsungremotetvandroid.domain.model.ConnectionState
 import com.example.samsungremotetvandroid.domain.model.QuickLaunchShortcut
 import com.example.samsungremotetvandroid.domain.model.RemoteKey
@@ -17,6 +21,8 @@ import com.example.samsungremotetvandroid.domain.model.TvProtocol
 import com.example.samsungremotetvandroid.domain.repository.TvControlRepository
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.TimeUnit
@@ -44,7 +50,8 @@ import org.json.JSONObject
 @Singleton
 class InMemoryTvControlRepository @Inject constructor(
     @ApplicationContext private val context: Context,
-    private val diagnosticsTracker: DiagnosticsTracker
+    private val diagnosticsTracker: DiagnosticsTracker,
+    private val sensitivePairingStorage: SensitivePairingStorage
 ) : TvControlRepository {
     private val wsClient = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
@@ -62,6 +69,7 @@ class InMemoryTvControlRepository @Inject constructor(
 
     private val connectionMutex = Mutex()
     private val discoveryMutex = Mutex()
+    private val legacyCoordinator = LegacyEncryptedSessionCoordinator()
 
     private val savedTvsState = MutableStateFlow(
         listOf(
@@ -81,9 +89,18 @@ class InMemoryTvControlRepository @Inject constructor(
     private var activeTv: SamsungTv? = null
     private var activeSocket: WebSocket? = null
     private var readySignal: CompletableDeferred<Unit>? = null
+    private var activeTransport: ActiveTransport = ActiveTransport.MODERN
+    private var activeLegacyCredentialsSource: LegacyEncryptedSessionCoordinator.CredentialSource? = null
+    private var awaitingLegacyFirstCommand = false
+    private var activeLegacyPairing = false
 
     @Volatile
     private var readyForCommands: Boolean = false
+
+    private enum class ActiveTransport {
+        MODERN,
+        LEGACY_ENCRYPTED
+    }
 
     override val savedTvs: StateFlow<List<SamsungTv>> = savedTvsState.asStateFlow()
     override val discoveredTvs: StateFlow<List<SamsungTv>> = discoveredTvsState.asStateFlow()
@@ -200,23 +217,225 @@ class InMemoryTvControlRepository @Inject constructor(
             return
         }
 
-        if (tv.protocol != TvProtocol.MODERN) {
-            connectionStateFlow.value = ConnectionState.Error(
-                "Only the modern TV path is available in this phase"
+        when (tv.protocol) {
+            TvProtocol.MODERN -> connectModern(
+                tv = tv,
+                shouldPersistAfterConnect = (savedTv == null)
             )
-            diagnosticsTracker.recordError(
-                context = "connect_unsupported_protocol",
-                errorMessage = "connect blocked because protocol is unsupported in this phase",
-                metadata = mapOf(
-                    "tvId" to tv.id,
-                    "protocol" to tv.protocol.name
+
+            TvProtocol.LEGACY_ENCRYPTED -> connectLegacyEncrypted(tv)
+
+            TvProtocol.LEGACY_REMOTE -> {
+                connectionStateFlow.value = ConnectionState.Error(
+                    "Legacy remote transport is out of scope for this encrypted/JU spike."
                 )
+                diagnosticsTracker.recordError(
+                    context = "connect_unsupported_protocol",
+                    errorMessage = "legacy remote transport not implemented in this phase",
+                    metadata = mapOf(
+                        "tvId" to tv.id,
+                        "protocol" to tv.protocol.name
+                    )
+                )
+            }
+        }
+    }
+
+    override suspend fun disconnect() {
+        diagnosticsTracker.log(
+            category = DiagnosticsCategory.LIFECYCLE,
+            message = "disconnect requested"
+        )
+        connectionMutex.withLock {
+            readySignal?.cancel()
+            readySignal = null
+            activeLegacyPairing = false
+            awaitingLegacyFirstCommand = false
+            activeLegacyCredentialsSource = null
+            shutdownActiveSocket(setDisconnected = true)
+        }
+    }
+
+    override suspend fun completeEncryptedPairing(tvId: String, pin: String) {
+        val sanitizedPin = pin.trim()
+        if (sanitizedPin.isEmpty()) {
+            connectionStateFlow.value = ConnectionState.Error("Enter the PIN shown on your TV.")
+            diagnosticsTracker.recordError(
+                context = "complete_encrypted_pairing",
+                errorMessage = "pin submission blocked because pin is empty",
+                metadata = mapOf("tvId" to tvId)
             )
             return
         }
 
-        val shouldPersistAfterConnect = savedTv == null
+        connectionMutex.withLock {
+            val tv = activeTv
+            if (tv == null || tv.id != tvId || tv.protocol != TvProtocol.LEGACY_ENCRYPTED) {
+                connectionStateFlow.value = ConnectionState.Error(
+                    "Encrypted pairing is not active for this TV."
+                )
+                diagnosticsTracker.recordError(
+                    context = "complete_encrypted_pairing",
+                    errorMessage = "pairing completion ignored because active tv does not match",
+                    metadata = mapOf("tvId" to tvId)
+                )
+                return
+            }
 
+            val transition = legacyCoordinator.onPairingCompleted(tvId = tvId)
+            val identifier = pairingIdentifierFor(tv)
+            val credentials = SpcCredentials(
+                ctxUpperHex = "PENDING",
+                sessionId = 1
+            )
+            sensitivePairingStorage.saveSpcCredentials(credentials, identifier)
+            sensitivePairingStorage.saveSpcVariants(
+                SpcVariants(step0 = "CONFIRMED", step1 = "CONFIRMED"),
+                identifier
+            )
+
+            activeLegacyPairing = false
+            awaitingLegacyFirstCommand = transition.awaitingFirstCommand
+            activeLegacyCredentialsSource = transition.credentialSource
+            transition.emittedStates.lastOrNull()?.let { state ->
+                connectionStateFlow.value = state
+            }
+
+            diagnosticsTracker.log(
+                category = DiagnosticsCategory.PAIRING,
+                message = "encrypted pairing completed; awaiting first command readiness check",
+                metadata = mapOf("tvId" to tvId)
+            )
+        }
+    }
+
+    override suspend fun cancelEncryptedPairing(tvId: String) {
+        connectionMutex.withLock {
+            val tv = activeTv
+            if (tv == null || tv.id != tvId || tv.protocol != TvProtocol.LEGACY_ENCRYPTED) {
+                return
+            }
+
+            val transition = legacyCoordinator.onCancelPairing()
+            activeLegacyPairing = false
+            awaitingLegacyFirstCommand = transition.awaitingFirstCommand
+            activeLegacyCredentialsSource = transition.credentialSource
+            connectionStateFlow.value = ConnectionState.Disconnected
+
+            diagnosticsTracker.log(
+                category = DiagnosticsCategory.PAIRING,
+                message = "encrypted pairing cancelled",
+                metadata = mapOf("tvId" to tvId)
+            )
+        }
+    }
+
+    override suspend fun sendRemoteKey(key: RemoteKey) {
+        when (activeTransport) {
+            ActiveTransport.MODERN -> sendModernKey(key)
+            ActiveTransport.LEGACY_ENCRYPTED -> sendLegacyEncryptedKey(key)
+        }
+    }
+
+    override suspend fun launchQuickLaunchApp(tvId: String, shortcut: QuickLaunchShortcut) {
+        connectionStateFlow.value = ConnectionState.Error(
+            "Quick Launch transport is not implemented in this modern baseline"
+        )
+        diagnosticsTracker.log(
+            category = DiagnosticsCategory.CAPABILITIES,
+            message = "quick launch transport not implemented",
+            metadata = mapOf(
+                "tvId" to tvId,
+                "shortcut" to shortcut.title
+            )
+        )
+    }
+
+    override suspend fun forgetPairing(tvId: String) {
+        diagnosticsTracker.log(
+            category = DiagnosticsCategory.PAIRING,
+            message = "forget pairing requested",
+            metadata = mapOf("tvId" to tvId)
+        )
+        connectionMutex.withLock {
+            val tv = savedTvsState.value.firstOrNull { it.id == tvId }
+                ?: discoveredTvsState.value.firstOrNull { it.id == tvId }
+                ?: activeTv
+            if (tv != null) {
+                clearSensitiveArtifactsFor(tv)
+                if (activeTv?.id == tvId) {
+                    activeLegacyPairing = false
+                    awaitingLegacyFirstCommand = false
+                    activeLegacyCredentialsSource = null
+                }
+                diagnosticsTracker.log(
+                    category = DiagnosticsCategory.PAIRING,
+                    message = "pairing artifacts cleared",
+                    metadata = mapOf("tvId" to tvId)
+                )
+            }
+
+            if (activeTv?.id == tvId) {
+                readySignal?.cancel()
+                readySignal = null
+                shutdownActiveSocket(setDisconnected = true)
+            }
+        }
+    }
+
+    override suspend fun removeDevice(tvId: String) {
+        diagnosticsTracker.log(
+            category = DiagnosticsCategory.LIFECYCLE,
+            message = "remove device requested",
+            metadata = mapOf("tvId" to tvId)
+        )
+        connectionMutex.withLock {
+            val removedTv = savedTvsState.value.firstOrNull { it.id == tvId }
+            val removedIp = removedTv?.ipAddress
+
+            if (removedTv != null) {
+                clearSensitiveArtifactsFor(removedTv)
+            }
+
+            savedTvsState.update { tvs -> tvs.filterNot { it.id == tvId } }
+
+            if (removedIp != null) {
+                discoveredTvsState.update { tvs -> tvs.filterNot { it.ipAddress == removedIp } }
+            }
+
+            if (activeTv?.id == tvId) {
+                readySignal?.cancel()
+                readySignal = null
+                activeLegacyPairing = false
+                awaitingLegacyFirstCommand = false
+                activeLegacyCredentialsSource = null
+                shutdownActiveSocket(setDisconnected = true)
+            }
+        }
+    }
+
+    override suspend fun renameTv(tvId: String, newName: String) {
+        val normalizedName = newName.trim()
+        if (normalizedName.isEmpty()) {
+            return
+        }
+
+        savedTvsState.update { tvs ->
+            tvs.map { tv ->
+                if (tv.id == tvId) tv.copy(displayName = normalizedName) else tv
+            }
+        }
+        diagnosticsTracker.log(
+            category = DiagnosticsCategory.LIFECYCLE,
+            message = "rename tv requested",
+            metadata = mapOf("tvId" to tvId)
+        )
+    }
+
+    private suspend fun connectModern(
+        tv: SamsungTv,
+        shouldPersistAfterConnect: Boolean
+    ) {
         connectionMutex.withLock {
             shutdownActiveSocket(setDisconnected = false)
             connectionStateFlow.value = ConnectionState.Connecting
@@ -225,6 +444,11 @@ class InMemoryTvControlRepository @Inject constructor(
                 message = "connecting",
                 metadata = mapOf("tvId" to tv.id)
             )
+
+            activeTransport = ActiveTransport.MODERN
+            activeLegacyPairing = false
+            awaitingLegacyFirstCommand = false
+            activeLegacyCredentialsSource = null
 
             val signal = CompletableDeferred<Unit>()
             readySignal = signal
@@ -268,19 +492,41 @@ class InMemoryTvControlRepository @Inject constructor(
         }
     }
 
-    override suspend fun disconnect() {
-        diagnosticsTracker.log(
-            category = DiagnosticsCategory.LIFECYCLE,
-            message = "disconnect requested"
-        )
+    private suspend fun connectLegacyEncrypted(tv: SamsungTv) {
         connectionMutex.withLock {
-            readySignal?.cancel()
-            readySignal = null
-            shutdownActiveSocket(setDisconnected = true)
+            shutdownActiveSocket(setDisconnected = false)
+            activeTransport = ActiveTransport.LEGACY_ENCRYPTED
+            readyForCommands = false
+            activeTv = tv
+
+            val identifier = pairingIdentifierFor(tv)
+            val storedCredentials = sensitivePairingStorage.loadSpcCredentials(identifier)
+            val transition = legacyCoordinator.onConnect(
+                tvId = tv.id,
+                hasStoredCredentials = (storedCredentials != null)
+            )
+
+            activeLegacyPairing = transition.emittedStates.any { it is ConnectionState.Pairing || it is ConnectionState.PinRequired }
+            awaitingLegacyFirstCommand = transition.awaitingFirstCommand
+            activeLegacyCredentialsSource = transition.credentialSource
+
+            transition.emittedStates.forEach { state ->
+                connectionStateFlow.value = state
+            }
+
+            diagnosticsTracker.log(
+                category = DiagnosticsCategory.PAIRING,
+                message = if (storedCredentials != null) {
+                    "legacy encrypted connect using stored credentials"
+                } else {
+                    "legacy encrypted connect entering fresh pairing"
+                },
+                metadata = mapOf("tvId" to tv.id)
+            )
         }
     }
 
-    override suspend fun sendRemoteKey(key: RemoteKey) {
+    private suspend fun sendModernKey(key: RemoteKey) {
         if (!readyForCommands || connectionStateFlow.value !is ConnectionState.Ready) {
             connectionStateFlow.value = ConnectionState.Error(
                 "Remote input is unavailable until the TV is ready"
@@ -319,67 +565,67 @@ class InMemoryTvControlRepository @Inject constructor(
         }
     }
 
-    override suspend fun launchQuickLaunchApp(tvId: String, shortcut: QuickLaunchShortcut) {
-        connectionStateFlow.value = ConnectionState.Error(
-            "Quick Launch transport is not implemented in this modern baseline"
-        )
-        diagnosticsTracker.log(
-            category = DiagnosticsCategory.CAPABILITIES,
-            message = "quick launch transport not implemented",
-            metadata = mapOf(
-                "tvId" to tvId,
-                "shortcut" to shortcut.title
+    private suspend fun sendLegacyEncryptedKey(key: RemoteKey) {
+        val tv = activeTv
+        if (tv == null || tv.protocol != TvProtocol.LEGACY_ENCRYPTED) {
+            connectionStateFlow.value = ConnectionState.Error("Encrypted session is not active.")
+            diagnosticsTracker.recordError(
+                context = "legacy_send_key",
+                errorMessage = "encrypted key send ignored because encrypted session is inactive",
+                metadata = mapOf("key" to key.name)
             )
-        )
-    }
-
-    override suspend fun forgetPairing(tvId: String) {
-        diagnosticsTracker.log(
-            category = DiagnosticsCategory.PAIRING,
-            message = "forget pairing requested",
-            metadata = mapOf("tvId" to tvId)
-        )
-        val activeTvId = activeTv?.id
-        if (activeTvId == tvId) {
-            disconnect()
-        }
-    }
-
-    override suspend fun removeDevice(tvId: String) {
-        diagnosticsTracker.log(
-            category = DiagnosticsCategory.LIFECYCLE,
-            message = "remove device requested",
-            metadata = mapOf("tvId" to tvId)
-        )
-        val activeTvId = activeTv?.id
-        val removedIp = savedTvsState.value.firstOrNull { it.id == tvId }?.ipAddress
-
-        savedTvsState.update { tvs -> tvs.filterNot { it.id == tvId } }
-
-        if (removedIp != null) {
-            discoveredTvsState.update { tvs -> tvs.filterNot { it.ipAddress == removedIp } }
-        }
-
-        if (activeTvId == tvId) {
-            disconnect()
-        }
-    }
-
-    override suspend fun renameTv(tvId: String, newName: String) {
-        val normalizedName = newName.trim()
-        if (normalizedName.isEmpty()) {
             return
         }
 
-        savedTvsState.update { tvs ->
-            tvs.map { tv ->
-                if (tv.id == tvId) tv.copy(displayName = normalizedName) else tv
-            }
+        val state = connectionStateFlow.value
+        val isConnected = state is ConnectionState.ConnectedNotReady || state is ConnectionState.Ready
+        if (!isConnected) {
+            connectionStateFlow.value = ConnectionState.Error(
+                "Remote input is unavailable until encrypted pairing reaches connected state."
+            )
+            diagnosticsTracker.recordError(
+                context = "legacy_send_key_not_connected",
+                errorMessage = "encrypted key send blocked while pairing is incomplete",
+                metadata = mapOf("tvId" to tv.id)
+            )
+            return
         }
-        diagnosticsTracker.log(
-            category = DiagnosticsCategory.LIFECYCLE,
-            message = "rename tv requested",
-            metadata = mapOf("tvId" to tvId)
+
+        if (awaitingLegacyFirstCommand) {
+            val transition = legacyCoordinator.onFirstCommand(
+                tvId = tv.id,
+                source = activeLegacyCredentialsSource
+            )
+            awaitingLegacyFirstCommand = transition.awaitingFirstCommand
+            activeLegacyCredentialsSource = transition.credentialSource
+            activeLegacyPairing = transition.emittedStates.any { it is ConnectionState.Pairing || it is ConnectionState.PinRequired }
+
+            if (transition.emittedStates.any { it is ConnectionState.Pairing || it is ConnectionState.PinRequired }) {
+                clearSensitiveArtifactsFor(tv)
+            }
+
+            transition.emittedStates.forEach { emitted ->
+                connectionStateFlow.value = emitted
+            }
+
+            diagnosticsTracker.log(
+                category = DiagnosticsCategory.PAIRING,
+                message = "legacy first-command readiness fallback executed",
+                metadata = mapOf(
+                    "tvId" to tv.id,
+                    "credentialSource" to (activeLegacyCredentialsSource?.name ?: "NONE")
+                )
+            )
+            return
+        }
+
+        connectionStateFlow.value = ConnectionState.Error(
+            "Legacy encrypted/JU command transport is not implemented in this spike."
+        )
+        diagnosticsTracker.recordError(
+            context = "legacy_send_key_not_implemented",
+            errorMessage = "legacy encrypted command path is intentionally scaffold-only in this phase",
+            metadata = mapOf("tvId" to tv.id)
         )
     }
 
@@ -506,18 +752,42 @@ class InMemoryTvControlRepository @Inject constructor(
 
                 val deviceName = device.optString("name").ifBlank { "Samsung TV" }
                 val modelName = device.optString("modelName").ifBlank { "Samsung TV" }
+                val wifiMac = device.optString("wifiMac").orEmpty()
+                val tokenAuthSupport = device.optString("TokenAuthSupport").ifBlank {
+                    device.optString("tokenAuthSupport")
+                }
                 val displayName = if (deviceName.equals("Samsung TV", ignoreCase = true)) {
                     modelName
                 } else {
                     deviceName
+                }
+                val protocol = detectProtocol(
+                    modelName = modelName,
+                    tokenAuthSupport = tokenAuthSupport
+                )
+                val resolvedProtocol = if (protocol == TvProtocol.LEGACY_ENCRYPTED) {
+                    val supportsSpc = isTcpPortOpen(
+                        ipAddress = normalizedIp,
+                        port = 8080,
+                        timeoutMs = 2_000
+                    )
+                    if (supportsSpc) {
+                        TvProtocol.LEGACY_ENCRYPTED
+                    } else {
+                        TvProtocol.LEGACY_REMOTE
+                    }
+                } else {
+                    protocol
                 }
 
                 SamsungTv(
                     id = tvIdForIp(normalizedIp),
                     displayName = displayName,
                     ipAddress = normalizedIp,
-                    protocol = TvProtocol.MODERN,
-                    capabilities = DEFAULT_CAPABILITIES
+                    protocol = resolvedProtocol,
+                    capabilities = DEFAULT_CAPABILITIES,
+                    modelName = modelName,
+                    macAddress = wifiMac
                 )
             }
         }
@@ -659,6 +929,10 @@ class InMemoryTvControlRepository @Inject constructor(
         activeSocket = null
         activeTv = null
         readyForCommands = false
+        activeTransport = ActiveTransport.MODERN
+        activeLegacyPairing = false
+        awaitingLegacyFirstCommand = false
+        activeLegacyCredentialsSource = null
 
         if (setDisconnected) {
             connectionStateFlow.value = ConnectionState.Disconnected
@@ -700,6 +974,69 @@ class InMemoryTvControlRepository @Inject constructor(
                 payload.optString("method").takeIf { it.isNotBlank() }
             }
         }.getOrNull()
+    }
+
+    private fun detectProtocol(
+        modelName: String,
+        tokenAuthSupport: String
+    ): TvProtocol {
+        val tokenAuth = tokenAuthSupport.equals("true", ignoreCase = true)
+        if (tokenAuth) {
+            return TvProtocol.MODERN
+        }
+
+        val upperModel = modelName.uppercase()
+        val encryptedMarkers = listOf(
+            "JU", "JS", "J6", "J5", "J4",
+            "HU", "HS", "H6", "H5", "H4"
+        )
+        return if (encryptedMarkers.any { marker -> upperModel.contains(marker) }) {
+            TvProtocol.LEGACY_ENCRYPTED
+        } else {
+            TvProtocol.MODERN
+        }
+    }
+
+    private fun pairingIdentifierFor(tv: SamsungTv): String {
+        if (tv.macAddress.isNotBlank()) {
+            return tv.macAddress
+        }
+        return "ip_${tv.ipAddress}"
+    }
+
+    private fun clearSensitiveArtifactsFor(tv: SamsungTv) {
+        val identifiers = linkedSetOf(
+            pairingIdentifierFor(tv),
+            "ip_${tv.ipAddress}"
+        )
+
+        if (tv.macAddress.isNotBlank()) {
+            identifiers += tv.macAddress
+        }
+
+        identifiers.forEach { identifier ->
+            if (identifier.isNotBlank()) {
+                sensitivePairingStorage.deleteSensitiveData(identifier)
+            }
+        }
+    }
+
+    private suspend fun isTcpPortOpen(
+        ipAddress: String,
+        port: Int,
+        timeoutMs: Int
+    ): Boolean {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                Socket().use { socket ->
+                    socket.connect(
+                        InetSocketAddress(ipAddress, port),
+                        timeoutMs
+                    )
+                    true
+                }
+            }.getOrDefault(false)
+        }
     }
 
     private fun isOnWifi(): Boolean {

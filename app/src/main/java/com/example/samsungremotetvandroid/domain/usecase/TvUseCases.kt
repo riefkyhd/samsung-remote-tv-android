@@ -44,6 +44,20 @@ class ConnectToTvUseCase @Inject constructor(
     suspend operator fun invoke(tvId: String) = repository.connect(tvId)
 }
 
+class CompleteEncryptedPairingUseCase @Inject constructor(
+    private val repository: TvControlRepository
+) {
+    suspend operator fun invoke(tvId: String, pin: String) {
+        repository.completeEncryptedPairing(tvId = tvId, pin = pin)
+    }
+}
+
+class CancelEncryptedPairingUseCase @Inject constructor(
+    private val repository: TvControlRepository
+) {
+    suspend operator fun invoke(tvId: String) = repository.cancelEncryptedPairing(tvId)
+}
+
 class DisconnectFromTvUseCase @Inject constructor(
     private val repository: TvControlRepository
 ) {
