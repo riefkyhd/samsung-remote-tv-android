@@ -11,6 +11,8 @@ import org.junit.Test
 class RemoteCapabilityPolicyTest {
     @Test
     fun capabilityForKey_mapsRemoteKeysToExpectedCapabilities() {
+        assertEquals(TvCapability.D_PAD, capabilityForKey(RemoteKey.HOME))
+        assertEquals(TvCapability.D_PAD, capabilityForKey(RemoteKey.BACK))
         assertEquals(TvCapability.D_PAD, capabilityForKey(RemoteKey.D_PAD_UP))
         assertEquals(TvCapability.VOLUME, capabilityForKey(RemoteKey.MUTE))
         assertEquals(TvCapability.MEDIA, capabilityForKey(RemoteKey.MEDIA_PLAY_PAUSE))

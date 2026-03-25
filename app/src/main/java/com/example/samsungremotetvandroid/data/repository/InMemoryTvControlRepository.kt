@@ -5,13 +5,13 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import android.net.wifi.WifiManager
 import android.util.Base64
 import com.example.samsungremotetvandroid.core.diagnostics.DiagnosticsCategory
 import com.example.samsungremotetvandroid.core.diagnostics.DiagnosticsTracker
+import com.example.samsungremotetvandroid.data.legacy.LegacyTcpRemoteClient
 import com.example.samsungremotetvandroid.data.legacy.LegacyEncryptedSessionCoordinator
 import com.example.samsungremotetvandroid.data.storage.SensitivePairingStorage
-import com.example.samsungremotetvandroid.data.storage.SpcCredentials
-import com.example.samsungremotetvandroid.data.storage.SpcVariants
 import com.example.samsungremotetvandroid.domain.model.ConnectionState
 import com.example.samsungremotetvandroid.domain.model.QuickLaunchShortcut
 import com.example.samsungremotetvandroid.domain.model.RemoteKey
@@ -21,15 +21,26 @@ import com.example.samsungremotetvandroid.domain.model.TvProtocol
 import com.example.samsungremotetvandroid.domain.repository.TvControlRepository
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.net.InetAddress
+import java.net.Inet4Address
 import java.net.InetSocketAddress
+import java.net.NetworkInterface
 import java.net.Socket
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
+import javax.net.ssl.HostnameVerifier
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -37,10 +48,13 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import okhttp3.OkHttpClient
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
@@ -57,10 +71,18 @@ class InMemoryTvControlRepository @Inject constructor(
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .build()
 
+    private val wsSecureClient = buildTrustingWsClient()
+
     private val restClient = OkHttpClient.Builder()
         .connectTimeout(2, TimeUnit.SECONDS)
         .readTimeout(2, TimeUnit.SECONDS)
         .writeTimeout(2, TimeUnit.SECONDS)
+        .build()
+
+    private val restProbeClient = restClient.newBuilder()
+        .connectTimeout(450, TimeUnit.MILLISECONDS)
+        .readTimeout(450, TimeUnit.MILLISECONDS)
+        .writeTimeout(450, TimeUnit.MILLISECONDS)
         .build()
 
     private val nsdManager by lazy {
@@ -70,18 +92,9 @@ class InMemoryTvControlRepository @Inject constructor(
     private val connectionMutex = Mutex()
     private val discoveryMutex = Mutex()
     private val legacyCoordinator = LegacyEncryptedSessionCoordinator()
+    private val legacyTcpClient = LegacyTcpRemoteClient()
 
-    private val savedTvsState = MutableStateFlow(
-        listOf(
-            SamsungTv(
-                id = "living-room-tv",
-                displayName = "Living Room TV",
-                ipAddress = "192.168.1.20",
-                protocol = TvProtocol.MODERN,
-                capabilities = DEFAULT_CAPABILITIES
-            )
-        )
-    )
+    private val savedTvsState = MutableStateFlow<List<SamsungTv>>(emptyList())
 
     private val discoveredTvsState = MutableStateFlow<List<SamsungTv>>(emptyList())
     private val connectionStateFlow = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
@@ -93,14 +106,36 @@ class InMemoryTvControlRepository @Inject constructor(
     private var activeLegacyCredentialsSource: LegacyEncryptedSessionCoordinator.CredentialSource? = null
     private var awaitingLegacyFirstCommand = false
     private var activeLegacyPairing = false
+    private var activeModernCommandMode: ModernCommandMode = ModernCommandMode.REMOTE_CONTROL
+    private var activeModernSessionId: String? = null
 
     @Volatile
     private var readyForCommands: Boolean = false
+
+    @Volatile
+    private var modernUnauthorizedEvent: Boolean = false
+
+    @Volatile
+    private var modernLastErrorMessage: String? = null
 
     private enum class ActiveTransport {
         MODERN,
         LEGACY_ENCRYPTED
     }
+
+    private enum class ModernCommandMode {
+        REMOTE_CONTROL,
+        EMIT_KEYPRESS,
+        EMIT_KEYPRESS_WITH_SESSION,
+        EMIT_REMOTE_CONTROL_WITH_SESSION
+    }
+
+    private data class ModernConnectAttempt(
+        val label: String,
+        val url: String,
+        val usesToken: Boolean,
+        val client: OkHttpClient
+    )
 
     override val savedTvs: StateFlow<List<SamsungTv>> = savedTvsState.asStateFlow()
     override val discoveredTvs: StateFlow<List<SamsungTv>> = discoveredTvsState.asStateFlow()
@@ -122,32 +157,41 @@ class InMemoryTvControlRepository @Inject constructor(
                 return
             }
 
-            val serviceTypes = listOf(
-                "_samsungctl._tcp.",
-                "_samsung-multiscreen._tcp."
-            )
-
-            val services = mutableListOf<NsdServiceInfo>()
-            serviceTypes.forEach { serviceType ->
-                services += discoverServices(serviceType)
-            }
-
             val foundByIp = linkedMapOf<String, SamsungTv>()
-            services.forEach { serviceInfo ->
+            var usedFallback = false
+            discoverViaNsd().forEach { serviceInfo ->
                 val ipAddress = resolveServiceIp(serviceInfo) ?: return@forEach
                 if (foundByIp.containsKey(ipAddress)) {
                     return@forEach
                 }
 
-                val tv = fetchModernTvInfo(ipAddress) ?: return@forEach
+                val tv = fetchTvInfoWithFallback(
+                    ipAddress = ipAddress,
+                    fallbackDisplayName = serviceInfo.serviceName
+                ) ?: return@forEach
                 foundByIp[ipAddress] = tv
+            }
+
+            if (foundByIp.isEmpty()) {
+                usedFallback = true
+                diagnosticsTracker.log(
+                    category = DiagnosticsCategory.LIFECYCLE,
+                    message = "nsd discovery empty, running subnet fallback"
+                )
+                val fallbackByIp = discoverViaSubnetFallback()
+                fallbackByIp.forEach { tv ->
+                    foundByIp[tv.ipAddress] = tv
+                }
             }
 
             discoveredTvsState.value = foundByIp.values.toList()
             diagnosticsTracker.log(
                 category = DiagnosticsCategory.LIFECYCLE,
                 message = "discovery scan completed",
-                metadata = mapOf("discoveredCount" to foundByIp.size.toString())
+                metadata = mapOf(
+                    "discoveredCount" to foundByIp.size.toString(),
+                    "fallbackUsed" to usedFallback.toString()
+                )
             )
         }
     }
@@ -169,7 +213,7 @@ class InMemoryTvControlRepository @Inject constructor(
             throw IllegalStateException("Connect to Wi-Fi, then try again.")
         }
 
-        val tv = fetchModernTvInfo(normalizedIp)
+        val tv = fetchTvInfoWithFallback(normalizedIp)
             ?: run {
                 diagnosticsTracker.recordError(
                     context = "scan_manual_ip",
@@ -218,24 +262,40 @@ class InMemoryTvControlRepository @Inject constructor(
         }
 
         when (tv.protocol) {
-            TvProtocol.MODERN -> connectModern(
+            TvProtocol.MODERN -> {
+                connectModern(
+                    tv = tv,
+                    shouldPersistAfterConnect = (savedTv == null)
+                )
+                if (connectionStateFlow.value is ConnectionState.Error && isLegacyModel(tv.modelName)) {
+                    diagnosticsTracker.log(
+                        category = DiagnosticsCategory.PROTOCOL,
+                        message = "modern connect failed on legacy-marked model; trying encrypted fallback",
+                        metadata = mapOf("tvId" to tv.id)
+                    )
+                    connectLegacyEncrypted(
+                        tv = tv.copy(protocol = TvProtocol.LEGACY_ENCRYPTED),
+                        shouldPersistAfterConnect = (savedTv == null),
+                        skipModernProbe = true
+                    )
+                }
+            }
+
+            TvProtocol.LEGACY_ENCRYPTED -> connectLegacyEncrypted(
                 tv = tv,
-                shouldPersistAfterConnect = (savedTv == null)
+                shouldPersistAfterConnect = (savedTv == null),
+                skipModernProbe = false
             )
 
-            TvProtocol.LEGACY_ENCRYPTED -> connectLegacyEncrypted(tv)
-
             TvProtocol.LEGACY_REMOTE -> {
-                connectionStateFlow.value = ConnectionState.Error(
-                    "Legacy remote transport is out of scope for this encrypted/JU spike."
+                diagnosticsTracker.log(
+                    category = DiagnosticsCategory.PROTOCOL,
+                    message = "legacy remote protocol selected; attempting modern fallback first",
+                    metadata = mapOf("tvId" to tv.id)
                 )
-                diagnosticsTracker.recordError(
-                    context = "connect_unsupported_protocol",
-                    errorMessage = "legacy remote transport not implemented in this phase",
-                    metadata = mapOf(
-                        "tvId" to tv.id,
-                        "protocol" to tv.protocol.name
-                    )
+                connectModern(
+                    tv = tv,
+                    shouldPersistAfterConnect = (savedTv == null)
                 )
             }
         }
@@ -252,6 +312,7 @@ class InMemoryTvControlRepository @Inject constructor(
             activeLegacyPairing = false
             awaitingLegacyFirstCommand = false
             activeLegacyCredentialsSource = null
+            legacyTcpClient.disconnect()
             shutdownActiveSocket(setDisconnected = true)
         }
     }
@@ -268,6 +329,7 @@ class InMemoryTvControlRepository @Inject constructor(
             return
         }
 
+        var tvToReconnect: SamsungTv? = null
         connectionMutex.withLock {
             val tv = activeTv
             if (tv == null || tv.id != tvId || tv.protocol != TvProtocol.LEGACY_ENCRYPTED) {
@@ -283,28 +345,25 @@ class InMemoryTvControlRepository @Inject constructor(
             }
 
             val transition = legacyCoordinator.onPairingCompleted(tvId = tvId)
-            val identifier = pairingIdentifierFor(tv)
-            val credentials = SpcCredentials(
-                ctxUpperHex = "PENDING",
-                sessionId = 1
-            )
-            sensitivePairingStorage.saveSpcCredentials(credentials, identifier)
-            sensitivePairingStorage.saveSpcVariants(
-                SpcVariants(step0 = "CONFIRMED", step1 = "CONFIRMED"),
-                identifier
-            )
-
             activeLegacyPairing = false
-            awaitingLegacyFirstCommand = transition.awaitingFirstCommand
-            activeLegacyCredentialsSource = transition.credentialSource
+            awaitingLegacyFirstCommand = false
+            activeLegacyCredentialsSource = null
             transition.emittedStates.lastOrNull()?.let { state ->
                 connectionStateFlow.value = state
             }
+            tvToReconnect = tv
 
             diagnosticsTracker.log(
                 category = DiagnosticsCategory.PAIRING,
-                message = "encrypted pairing completed; awaiting first command readiness check",
+                message = "encrypted pairing accepted; attempting legacy command channel connect",
                 metadata = mapOf("tvId" to tvId)
+            )
+        }
+
+        tvToReconnect?.let { tv ->
+            connectLegacyCommandChannel(
+                tv = tv,
+                shouldPersistAfterConnect = true
             )
         }
     }
@@ -449,61 +508,172 @@ class InMemoryTvControlRepository @Inject constructor(
             activeLegacyPairing = false
             awaitingLegacyFirstCommand = false
             activeLegacyCredentialsSource = null
+            activeModernCommandMode = ModernCommandMode.REMOTE_CONTROL
+            activeModernSessionId = null
 
-            val signal = CompletableDeferred<Unit>()
-            readySignal = signal
-            readyForCommands = false
-            activeTv = tv
+            val pairingIdentifier = pairingIdentifierFor(tv)
+            var storedToken = sensitivePairingStorage.loadToken(pairingIdentifier)?.takeIf { it.isNotBlank() }
+            val attemptedUrls = linkedSetOf<String>()
+            var connected = false
 
-            val request = Request.Builder()
-                .url(buildModernSocketUrl(tv.ipAddress))
-                .build()
-
-            activeSocket = wsClient.newWebSocket(
-                request,
-                modernSocketListener(tv.id, signal)
-            )
-
-            try {
-                withTimeout(CONNECTION_READY_TIMEOUT_MS) {
-                    signal.await()
+            while (!connected) {
+                val pendingAttempts = buildModernAttempts(tv.ipAddress, storedToken)
+                    .filterNot { attempt -> attemptedUrls.contains(attempt.url) }
+                if (pendingAttempts.isEmpty()) {
+                    break
                 }
 
-                if (shouldPersistAfterConnect && connectionStateFlow.value is ConnectionState.Ready) {
-                    persistToSavedTvs(tv)
-                }
-            } catch (_: Throwable) {
-                if (connectionStateFlow.value !is ConnectionState.Error) {
-                    connectionStateFlow.value = ConnectionState.Error(
-                        "Modern connection opened but did not become ready in time"
+                val attempt = pendingAttempts.first()
+                attemptedUrls += attempt.url
+                modernUnauthorizedEvent = false
+                modernLastErrorMessage = null
+                readyForCommands = false
+                activeModernCommandMode = ModernCommandMode.REMOTE_CONTROL
+                activeModernSessionId = null
+
+                val signal = CompletableDeferred<Unit>()
+                readySignal = signal
+                activeTv = tv
+
+                diagnosticsTracker.log(
+                    category = DiagnosticsCategory.RECONNECT,
+                    message = "modern connect attempt",
+                    metadata = mapOf(
+                        "tvId" to tv.id,
+                        "endpoint" to attempt.label,
+                        "tokenUsed" to attempt.usesToken.toString()
                     )
-                    diagnosticsTracker.recordError(
-                        context = "connect_ready_timeout",
-                        errorMessage = "modern connection did not become ready in time",
+                )
+
+                val request = Request.Builder().url(attempt.url).build()
+                activeSocket = attempt.client.newWebSocket(
+                    request,
+                    modernSocketListener(
+                        tvId = tv.id,
+                        signal = signal,
+                        tokenIdentifier = pairingIdentifier,
+                        attemptLabel = attempt.label
+                    )
+                )
+
+                val attemptSucceeded = try {
+                    withTimeout(CONNECTION_READY_TIMEOUT_MS) {
+                        signal.await()
+                    }
+                    connectionStateFlow.value is ConnectionState.Ready ||
+                        connectionStateFlow.value is ConnectionState.ConnectedNotReady
+                } catch (_: Throwable) {
+                    false
+                } finally {
+                    if (readySignal === signal) {
+                        readySignal = null
+                    }
+                }
+
+                if (attemptSucceeded) {
+                    connected = true
+                    break
+                }
+
+                val attemptError = modernLastErrorMessage
+                    ?: (connectionStateFlow.value as? ConnectionState.Error)?.message
+                    ?: "modern connection attempt failed"
+
+                diagnosticsTracker.recordError(
+                    context = "modern_connect_attempt",
+                    errorMessage = attemptError,
+                    metadata = mapOf(
+                        "tvId" to tv.id,
+                        "endpoint" to attempt.label,
+                        "tokenUsed" to attempt.usesToken.toString()
+                    )
+                )
+
+                if (modernUnauthorizedEvent && attempt.usesToken && storedToken != null) {
+                    sensitivePairingStorage.deleteToken(pairingIdentifier)
+                    storedToken = null
+                    diagnosticsTracker.log(
+                        category = DiagnosticsCategory.PAIRING,
+                        message = "cleared stale modern token after unauthorized response",
                         metadata = mapOf("tvId" to tv.id)
                     )
                 }
+
                 shutdownActiveSocket(setDisconnected = false)
-            } finally {
-                if (readySignal === signal) {
-                    readySignal = null
+                connectionStateFlow.value = ConnectionState.Connecting
+
+                val latestToken = sensitivePairingStorage.loadToken(pairingIdentifier)?.takeIf { it.isNotBlank() }
+                if (latestToken != storedToken) {
+                    storedToken = latestToken
+                    diagnosticsTracker.log(
+                        category = DiagnosticsCategory.PAIRING,
+                        message = "modern token changed between attempts; refreshing endpoint order",
+                        metadata = mapOf(
+                            "tvId" to tv.id,
+                            "hasToken" to (storedToken != null).toString()
+                        )
+                    )
                 }
             }
+
+            if (connected) {
+                if (shouldPersistAfterConnect &&
+                    (connectionStateFlow.value is ConnectionState.Ready ||
+                        connectionStateFlow.value is ConnectionState.ConnectedNotReady)
+                ) {
+                    persistToSavedTvs(tv)
+                }
+                return
+            }
+
+            val fallbackMessage = modernLastErrorMessage
+                ?: "Could not connect to this TV over the modern path. Keep the TV on the same Wi-Fi and retry."
+            connectionStateFlow.value = ConnectionState.Error(fallbackMessage)
+            diagnosticsTracker.recordError(
+                context = "connect_modern_failed",
+                errorMessage = fallbackMessage,
+                metadata = mapOf("tvId" to tv.id)
+            )
         }
     }
 
-    private suspend fun connectLegacyEncrypted(tv: SamsungTv) {
+    private suspend fun connectLegacyEncrypted(
+        tv: SamsungTv,
+        shouldPersistAfterConnect: Boolean,
+        skipModernProbe: Boolean
+    ) {
+        if (!skipModernProbe) {
+            diagnosticsTracker.log(
+                category = DiagnosticsCategory.PROTOCOL,
+                message = "legacy encrypted selected; trying modern command channel before PIN pairing",
+                metadata = mapOf("tvId" to tv.id)
+            )
+
+            connectModern(
+                tv = tv,
+                shouldPersistAfterConnect = shouldPersistAfterConnect
+            )
+            if (connectionStateFlow.value is ConnectionState.Ready ||
+                connectionStateFlow.value is ConnectionState.ConnectedNotReady
+            ) {
+                diagnosticsTracker.log(
+                    category = DiagnosticsCategory.PROTOCOL,
+                    message = "legacy encrypted tv connected via modern command channel",
+                    metadata = mapOf("tvId" to tv.id)
+                )
+                return
+            }
+        }
+
         connectionMutex.withLock {
             shutdownActiveSocket(setDisconnected = false)
             activeTransport = ActiveTransport.LEGACY_ENCRYPTED
             readyForCommands = false
             activeTv = tv
 
-            val identifier = pairingIdentifierFor(tv)
-            val storedCredentials = sensitivePairingStorage.loadSpcCredentials(identifier)
             val transition = legacyCoordinator.onConnect(
                 tvId = tv.id,
-                hasStoredCredentials = (storedCredentials != null)
+                hasStoredCredentials = false
             )
 
             activeLegacyPairing = transition.emittedStates.any { it is ConnectionState.Pairing || it is ConnectionState.PinRequired }
@@ -514,23 +684,82 @@ class InMemoryTvControlRepository @Inject constructor(
                 connectionStateFlow.value = state
             }
 
+            val requiresPinPage = transition.emittedStates.any { it is ConnectionState.PinRequired }
+            if (requiresPinPage) {
+                val pinPageReady = prepareLegacyPinPage(tv.ipAddress)
+                if (!pinPageReady) {
+                    connectionStateFlow.value = ConnectionState.Error(
+                        "Could not open the PIN page on TV. Keep the TV awake and retry."
+                    )
+                    diagnosticsTracker.recordError(
+                        context = "legacy_prepare_pin_page",
+                        errorMessage = "legacy cloud pin page could not be started",
+                        metadata = mapOf("tvId" to tv.id)
+                    )
+                    return
+                }
+            }
+
             diagnosticsTracker.log(
                 category = DiagnosticsCategory.PAIRING,
-                message = if (storedCredentials != null) {
-                    "legacy encrypted connect using stored credentials"
-                } else {
-                    "legacy encrypted connect entering fresh pairing"
-                },
+                message = "legacy encrypted connect entering fresh pairing",
                 metadata = mapOf("tvId" to tv.id)
             )
         }
     }
 
-    private suspend fun sendModernKey(key: RemoteKey) {
-        if (!readyForCommands || connectionStateFlow.value !is ConnectionState.Ready) {
-            connectionStateFlow.value = ConnectionState.Error(
-                "Remote input is unavailable until the TV is ready"
+    private suspend fun connectLegacyCommandChannel(
+        tv: SamsungTv,
+        shouldPersistAfterConnect: Boolean
+    ) {
+        connectionMutex.withLock {
+            shutdownActiveSocket(setDisconnected = false)
+            activeTransport = ActiveTransport.LEGACY_ENCRYPTED
+            activeTv = tv
+            readyForCommands = false
+            connectionStateFlow.value = ConnectionState.Connecting
+
+            val connectResult = runCatching {
+                withContext(Dispatchers.IO) {
+                    legacyTcpClient.connect(
+                        ipAddress = tv.ipAddress,
+                        remoteName = MODERN_CLIENT_NAME
+                    )
+                }
+            }
+
+            val connectedPort = connectResult.getOrElse { error ->
+                val message = error.message ?: "Could not open the legacy command channel after PIN."
+                connectionStateFlow.value = ConnectionState.Error(message)
+                diagnosticsTracker.recordError(
+                    context = "connect_legacy_command_channel",
+                    errorMessage = message,
+                    metadata = mapOf("tvId" to tv.id)
+                )
+                return@withLock
+            }
+
+            readyForCommands = true
+            connectionStateFlow.value = ConnectionState.Ready(tv.id)
+            diagnosticsTracker.log(
+                category = DiagnosticsCategory.LIFECYCLE,
+                message = "legacy command channel is ready",
+                metadata = mapOf(
+                    "tvId" to tv.id,
+                    "port" to connectedPort.toString()
+                )
             )
+
+            if (shouldPersistAfterConnect) {
+                persistToSavedTvs(tv)
+            }
+        }
+    }
+
+    private suspend fun sendModernKey(key: RemoteKey) {
+        val currentState = connectionStateFlow.value
+        val canSendInput = currentState is ConnectionState.Ready
+        if (!canSendInput) {
             diagnosticsTracker.recordError(
                 context = "send_key_not_ready",
                 errorMessage = "remote key blocked because connection is not ready",
@@ -541,9 +770,6 @@ class InMemoryTvControlRepository @Inject constructor(
 
         val keyCode = modernKeyCodeFor(key)
         if (keyCode == null) {
-            connectionStateFlow.value = ConnectionState.Error(
-                "Unsupported key for modern path: $key"
-            )
             diagnosticsTracker.recordError(
                 context = "send_key_unsupported",
                 errorMessage = "unsupported key for modern transport",
@@ -552,7 +778,12 @@ class InMemoryTvControlRepository @Inject constructor(
             return
         }
 
-        val sent = activeSocket?.send(buildRemoteKeyPayload(keyCode)) ?: false
+        val payload = buildModernKeyPayload(
+            keyCode = keyCode,
+            mode = activeModernCommandMode,
+            sessionId = activeModernSessionId
+        )
+        val sent = activeSocket?.send(payload) ?: false
         if (!sent) {
             connectionStateFlow.value = ConnectionState.Error(
                 "Failed to send remote key on modern path"
@@ -577,56 +808,299 @@ class InMemoryTvControlRepository @Inject constructor(
             return
         }
 
-        val state = connectionStateFlow.value
-        val isConnected = state is ConnectionState.ConnectedNotReady || state is ConnectionState.Ready
-        if (!isConnected) {
+        if (connectionStateFlow.value is ConnectionState.PinRequired) {
             connectionStateFlow.value = ConnectionState.Error(
-                "Remote input is unavailable until encrypted pairing reaches connected state."
+                "Enter the TV PIN first, then connect."
             )
             diagnosticsTracker.recordError(
-                context = "legacy_send_key_not_connected",
-                errorMessage = "encrypted key send blocked while pairing is incomplete",
+                context = "legacy_send_key_pin_required",
+                errorMessage = "encrypted key send blocked because PIN is still required",
                 metadata = mapOf("tvId" to tv.id)
             )
             return
         }
 
-        if (awaitingLegacyFirstCommand) {
-            val transition = legacyCoordinator.onFirstCommand(
-                tvId = tv.id,
-                source = activeLegacyCredentialsSource
+        if (connectionStateFlow.value !is ConnectionState.Ready) {
+            diagnosticsTracker.recordError(
+                context = "legacy_send_key_not_ready",
+                errorMessage = "encrypted key send blocked because legacy command channel is not ready",
+                metadata = mapOf("tvId" to tv.id)
             )
-            awaitingLegacyFirstCommand = transition.awaitingFirstCommand
-            activeLegacyCredentialsSource = transition.credentialSource
-            activeLegacyPairing = transition.emittedStates.any { it is ConnectionState.Pairing || it is ConnectionState.PinRequired }
+            return
+        }
 
-            if (transition.emittedStates.any { it is ConnectionState.Pairing || it is ConnectionState.PinRequired }) {
-                clearSensitiveArtifactsFor(tv)
-            }
-
-            transition.emittedStates.forEach { emitted ->
-                connectionStateFlow.value = emitted
-            }
-
-            diagnosticsTracker.log(
-                category = DiagnosticsCategory.PAIRING,
-                message = "legacy first-command readiness fallback executed",
+        val keyCode = legacyKeyCodeFor(key)
+        if (keyCode == null) {
+            diagnosticsTracker.recordError(
+                context = "legacy_send_key_unsupported",
+                errorMessage = "unsupported key for legacy encrypted path",
                 metadata = mapOf(
                     "tvId" to tv.id,
-                    "credentialSource" to (activeLegacyCredentialsSource?.name ?: "NONE")
+                    "key" to key.name
                 )
             )
             return
         }
 
-        connectionStateFlow.value = ConnectionState.Error(
-            "Legacy encrypted/JU command transport is not implemented in this spike."
+        runCatching {
+            withContext(Dispatchers.IO) {
+                legacyTcpClient.sendKey(keyCode)
+            }
+        }.onFailure { error ->
+            val message = error.message ?: "Failed to send remote key over legacy path."
+            connectionStateFlow.value = ConnectionState.Error(message)
+            diagnosticsTracker.recordError(
+                context = "legacy_send_key_failed",
+                errorMessage = message,
+                metadata = mapOf(
+                    "tvId" to tv.id,
+                    "key" to key.name
+                )
+            )
+        }
+    }
+
+    private fun buildModernAttempts(ipAddress: String, storedToken: String?): List<ModernConnectAttempt> {
+        val token = storedToken?.takeIf { it.isNotBlank() }
+        val attempts = mutableListOf<ModernConnectAttempt>()
+
+        if (token != null) {
+            attempts += ModernConnectAttempt(
+                label = "wss:8002(token)",
+                url = buildModernSocketUrl(
+                    ipAddress = ipAddress,
+                    scheme = "wss",
+                    port = 8002,
+                    token = token
+                ),
+                usesToken = true,
+                client = wsSecureClient
+            )
+        }
+        attempts += ModernConnectAttempt(
+            label = "wss:8002",
+            url = buildModernSocketUrl(
+                ipAddress = ipAddress,
+                scheme = "wss",
+                port = 8002,
+                token = null
+            ),
+            usesToken = false,
+            client = wsSecureClient
         )
-        diagnosticsTracker.recordError(
-            context = "legacy_send_key_not_implemented",
-            errorMessage = "legacy encrypted command path is intentionally scaffold-only in this phase",
-            metadata = mapOf("tvId" to tv.id)
+        if (token != null) {
+            attempts += ModernConnectAttempt(
+                label = "ws:8001(token)",
+                url = buildModernSocketUrl(
+                    ipAddress = ipAddress,
+                    scheme = "ws",
+                    port = 8001,
+                    token = token
+                ),
+                usesToken = true,
+                client = wsClient
+            )
+        }
+        attempts += ModernConnectAttempt(
+            label = "ws:8001",
+            url = buildModernSocketUrl(
+                ipAddress = ipAddress,
+                scheme = "ws",
+                port = 8001,
+                token = null
+            ),
+            usesToken = false,
+            client = wsClient
         )
+        return attempts
+    }
+
+    private suspend fun discoverViaNsd(): List<NsdServiceInfo> {
+        val multicastLock = acquireMulticastLock()
+        return try {
+            NSD_SERVICE_TYPES
+                .flatMap { serviceType -> discoverServices(serviceType) }
+                .distinctBy { serviceInfo ->
+                    val host = serviceInfo.host?.hostAddress.orEmpty()
+                    "${serviceInfo.serviceName}|$host"
+                }
+        } finally {
+            runCatching {
+                if (multicastLock?.isHeld == true) {
+                    multicastLock.release()
+                }
+            }
+        }
+    }
+
+    private suspend fun discoverViaSubnetFallback(): List<SamsungTv> {
+        val prefixes = linkedSetOf<String>()
+        prefixes += localSubnetPrefixes()
+        prefixes += subnetPrefixesFromKnownTvs(savedTvsState.value)
+        prefixes += subnetPrefixesFromKnownTvs(discoveredTvsState.value)
+
+        if (prefixes.isEmpty()) {
+            diagnosticsTracker.recordError(
+                context = "subnet_discovery",
+                errorMessage = "subnet fallback skipped because no ipv4 subnet prefix was found"
+            )
+            return emptyList()
+        }
+
+        val localIps = localIpv4Addresses()
+        val candidateIps = prefixes
+            .flatMap { prefix ->
+                (1..254).asSequence()
+                    .map { host -> "$prefix.$host" }
+                    .filterNot { ip -> ip in localIps }
+                    .toList()
+            }
+            .distinct()
+
+        return coroutineScope {
+            val semaphore = Semaphore(SUBNET_DISCOVERY_CONCURRENCY)
+            val deferred = candidateIps.map { candidateIp ->
+                async(Dispatchers.IO) {
+                    semaphore.withPermit {
+                        probeIpCandidate(candidateIp)
+                    }
+                }
+            }
+            deferred.awaitAll()
+                .filterNotNull()
+                .distinctBy { tv -> tv.ipAddress }
+        }
+    }
+
+    private suspend fun probeIpCandidate(ipAddress: String): SamsungTv? {
+        val modernPortOpen = isTcpPortOpen(
+            ipAddress = ipAddress,
+            port = 8001,
+            timeoutMs = SUBNET_PROBE_PORT_TIMEOUT_MS
+        )
+        val legacyRemotePortOpen = LEGACY_REMOTE_PORTS.any { port ->
+            isTcpPortOpen(
+                ipAddress = ipAddress,
+                port = port,
+                timeoutMs = SUBNET_PROBE_PORT_TIMEOUT_MS
+            )
+        }
+        val legacyPairingPortOpen = isTcpPortOpen(
+            ipAddress = ipAddress,
+            port = 8080,
+            timeoutMs = SUBNET_PROBE_PORT_TIMEOUT_MS
+        )
+
+        if (!modernPortOpen && !legacyRemotePortOpen && !legacyPairingPortOpen) {
+            return null
+        }
+
+        return fetchTvInfoWithFallback(
+            ipAddress = ipAddress,
+            client = restProbeClient,
+            knownLegacyRemotePortOpen = legacyRemotePortOpen,
+            knownLegacyPairingPortOpen = legacyPairingPortOpen
+        )
+    }
+
+    private suspend fun prepareLegacyPinPage(ipAddress: String): Boolean {
+        return withContext(Dispatchers.IO) {
+            val pinUrl = "http://$ipAddress:8080/ws/apps/CloudPINPage"
+            val pinRunUrl = "http://$ipAddress:8080/ws/apps/CloudPINPage/run"
+
+            runCatching {
+                val deleteRequest = Request.Builder()
+                    .url(pinRunUrl)
+                    .delete()
+                    .build()
+                restClient.newCall(deleteRequest).execute().close()
+            }
+
+            runCatching {
+                val getRequest = Request.Builder()
+                    .url(pinUrl)
+                    .get()
+                    .build()
+                restClient.newCall(getRequest).execute().close()
+            }
+
+            val postResponse = runCatching {
+                val request = Request.Builder()
+                    .url(pinUrl)
+                    .post("pin4".toRequestBody())
+                    .build()
+                restClient.newCall(request).execute()
+            }.getOrNull() ?: return@withContext false
+
+            postResponse.use { response ->
+                if (!response.isSuccessful) {
+                    return@withContext false
+                }
+            }
+
+            repeat(PIN_PAGE_RUNNING_CHECK_ATTEMPTS) {
+                val stateBody = runCatching {
+                    val stateRequest = Request.Builder()
+                        .url(pinUrl)
+                        .get()
+                        .build()
+                    restClient.newCall(stateRequest).execute().use { response ->
+                        if (!response.isSuccessful) {
+                            return@use ""
+                        }
+                        response.body?.string().orEmpty()
+                    }
+                }.getOrDefault("")
+
+                if (stateBody.contains("<state>running</state>", ignoreCase = true)) {
+                    return@withContext true
+                }
+
+                delay(PIN_PAGE_RUNNING_CHECK_INTERVAL_MS)
+            }
+
+            false
+        }
+    }
+
+    private fun acquireMulticastLock(): WifiManager.MulticastLock? {
+        val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            ?: return null
+        return runCatching {
+            wifiManager.createMulticastLock("samsung-remote-discovery").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }.getOrNull()
+    }
+
+    private fun localSubnetPrefixes(): Set<String> {
+        val addresses = localIpv4Addresses()
+        return addresses.mapNotNull { ipAddress -> ipv4Prefix(ipAddress) }.toSet()
+    }
+
+    private fun subnetPrefixesFromKnownTvs(tvs: List<SamsungTv>): Set<String> {
+        return tvs.mapNotNull { tv -> ipv4Prefix(tv.ipAddress) }.toSet()
+    }
+
+    private fun localIpv4Addresses(): Set<String> {
+        val interfaces = runCatching { NetworkInterface.getNetworkInterfaces() }.getOrNull() ?: return emptySet()
+        return interfaces.toList()
+            .filter { networkInterface -> networkInterface.isUp && !networkInterface.isLoopback }
+            .flatMap { networkInterface ->
+                networkInterface.inetAddresses.toList()
+                    .filterIsInstance<Inet4Address>()
+                    .mapNotNull { address -> normalizeIpv4(address.hostAddress) }
+            }
+            .toSet()
+    }
+
+    private fun ipv4Prefix(ipAddress: String): String? {
+        val segments = ipAddress.split('.')
+        if (segments.size != 4) {
+            return null
+        }
+        return "${segments[0]}.${segments[1]}.${segments[2]}"
     }
 
     private suspend fun discoverServices(serviceType: String): List<NsdServiceInfo> {
@@ -723,7 +1197,10 @@ class InMemoryTvControlRepository @Inject constructor(
         }
     }
 
-    private suspend fun fetchModernTvInfo(ipAddress: String): SamsungTv? {
+    private suspend fun fetchModernTvInfo(
+        ipAddress: String,
+        client: OkHttpClient = restClient
+    ): SamsungTv? {
         val normalizedIp = normalizeIpv4(ipAddress) ?: return null
 
         return withContext(Dispatchers.IO) {
@@ -732,7 +1209,7 @@ class InMemoryTvControlRepository @Inject constructor(
                 .build()
 
             val response = runCatching {
-                restClient.newCall(request).execute()
+                client.newCall(request).execute()
             }.getOrNull() ?: return@withContext null
 
             response.use {
@@ -753,44 +1230,92 @@ class InMemoryTvControlRepository @Inject constructor(
                 val deviceName = device.optString("name").ifBlank { "Samsung TV" }
                 val modelName = device.optString("modelName").ifBlank { "Samsung TV" }
                 val wifiMac = device.optString("wifiMac").orEmpty()
-                val tokenAuthSupport = device.optString("TokenAuthSupport").ifBlank {
-                    device.optString("tokenAuthSupport")
-                }
                 val displayName = if (deviceName.equals("Samsung TV", ignoreCase = true)) {
                     modelName
                 } else {
                     deviceName
                 }
-                val protocol = detectProtocol(
-                    modelName = modelName,
-                    tokenAuthSupport = tokenAuthSupport
-                )
-                val resolvedProtocol = if (protocol == TvProtocol.LEGACY_ENCRYPTED) {
-                    val supportsSpc = isTcpPortOpen(
-                        ipAddress = normalizedIp,
-                        port = 8080,
-                        timeoutMs = 2_000
-                    )
-                    if (supportsSpc) {
-                        TvProtocol.LEGACY_ENCRYPTED
-                    } else {
-                        TvProtocol.LEGACY_REMOTE
-                    }
-                } else {
-                    protocol
-                }
-
                 SamsungTv(
                     id = tvIdForIp(normalizedIp),
                     displayName = displayName,
                     ipAddress = normalizedIp,
-                    protocol = resolvedProtocol,
+                    protocol = TvProtocol.MODERN,
                     capabilities = DEFAULT_CAPABILITIES,
                     modelName = modelName,
                     macAddress = wifiMac
                 )
             }
         }
+    }
+
+    private suspend fun fetchTvInfoWithFallback(
+        ipAddress: String,
+        client: OkHttpClient = restClient,
+        fallbackDisplayName: String? = null,
+        knownLegacyRemotePortOpen: Boolean? = null,
+        knownLegacyPairingPortOpen: Boolean? = null
+    ): SamsungTv? {
+        val modern = fetchModernTvInfo(
+            ipAddress = ipAddress,
+            client = client
+        )
+        if (modern != null) {
+            return modern
+        }
+
+        return fetchLegacyTvInfo(
+            ipAddress = ipAddress,
+            fallbackDisplayName = fallbackDisplayName,
+            knownLegacyRemotePortOpen = knownLegacyRemotePortOpen,
+            knownLegacyPairingPortOpen = knownLegacyPairingPortOpen
+        )
+    }
+
+    private suspend fun fetchLegacyTvInfo(
+        ipAddress: String,
+        fallbackDisplayName: String?,
+        knownLegacyRemotePortOpen: Boolean?,
+        knownLegacyPairingPortOpen: Boolean?
+    ): SamsungTv? {
+        val normalizedIp = normalizeIpv4(ipAddress) ?: return null
+        val legacyRemotePortOpen = knownLegacyRemotePortOpen ?: LEGACY_REMOTE_PORTS.any { port ->
+            isTcpPortOpen(
+                ipAddress = normalizedIp,
+                port = port,
+                timeoutMs = 700
+            )
+        }
+        val legacyPairingPortOpen = knownLegacyPairingPortOpen ?: isTcpPortOpen(
+            ipAddress = normalizedIp,
+            port = 8080,
+            timeoutMs = 700
+        )
+
+        if (!legacyRemotePortOpen && !legacyPairingPortOpen) {
+            return null
+        }
+
+        val protocol = if (legacyPairingPortOpen) {
+            TvProtocol.LEGACY_ENCRYPTED
+        } else {
+            TvProtocol.LEGACY_REMOTE
+        }
+        val label = fallbackDisplayName?.takeIf { it.isNotBlank() } ?: "Samsung TV"
+        val model = if (protocol == TvProtocol.LEGACY_ENCRYPTED) {
+            "Legacy Encrypted TV"
+        } else {
+            "Legacy TV"
+        }
+
+        return SamsungTv(
+            id = tvIdForIp(normalizedIp),
+            displayName = label,
+            ipAddress = normalizedIp,
+            protocol = protocol,
+            capabilities = DEFAULT_CAPABILITIES,
+            modelName = model,
+            macAddress = ""
+        )
     }
 
     private fun persistToSavedTvs(tv: SamsungTv) {
@@ -816,7 +1341,9 @@ class InMemoryTvControlRepository @Inject constructor(
 
     private fun modernSocketListener(
         tvId: String,
-        signal: CompletableDeferred<Unit>
+        signal: CompletableDeferred<Unit>,
+        tokenIdentifier: String,
+        attemptLabel: String
     ): WebSocketListener {
         return object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
@@ -825,16 +1352,35 @@ class InMemoryTvControlRepository @Inject constructor(
                 diagnosticsTracker.log(
                     category = DiagnosticsCategory.LIFECYCLE,
                     message = "modern socket opened",
-                    metadata = mapOf("tvId" to tvId)
+                    metadata = mapOf(
+                        "tvId" to tvId,
+                        "endpoint" to attemptLabel
+                    )
                 )
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
                 if (activeTv?.id != tvId) return
 
-                when (extractEventName(text)) {
+                val eventName = extractEventName(text)
+                val reason = extractErrorReason(text).orEmpty()
+                val sessionId = extractSessionIdentifier(text)
+                if (!sessionId.isNullOrBlank()) {
+                    activeModernSessionId = sessionId
+                }
+                when (eventName) {
                     EVENT_CHANNEL_CONNECT,
+                    EVENT_CHANNEL_CLIENT_CONNECT,
                     EVENT_CHANNEL_READY -> {
+                        val token = extractToken(text)
+                        if (!token.isNullOrBlank()) {
+                            sensitivePairingStorage.saveToken(token, tokenIdentifier)
+                            diagnosticsTracker.log(
+                                category = DiagnosticsCategory.PAIRING,
+                                message = "modern token updated from tv response",
+                                metadata = mapOf("tvId" to tvId)
+                            )
+                        }
                         readyForCommands = true
                         connectionStateFlow.value = ConnectionState.Ready(tvId)
                         diagnosticsTracker.log(
@@ -848,6 +1394,7 @@ class InMemoryTvControlRepository @Inject constructor(
                     }
 
                     EVENT_CHANNEL_UNAUTHORIZED -> {
+                        modernUnauthorizedEvent = true
                         handleSocketFailure(
                             tvId = tvId,
                             signal = signal,
@@ -855,6 +1402,64 @@ class InMemoryTvControlRepository @Inject constructor(
                             message = "TV rejected pairing/authorization on modern path"
                         )
                     }
+
+                    EVENT_CHANNEL_ERROR -> {
+                        if (applyModernModeFallbackIfNeeded(
+                                tvId = tvId,
+                                reason = reason
+                            )
+                        ) {
+                            readyForCommands = true
+                            connectionStateFlow.value = ConnectionState.Ready(tvId)
+                            if (!signal.isCompleted) {
+                                signal.complete(Unit)
+                            }
+                            return
+                        }
+
+                        if (isAuthorizationFailure(reason)) {
+                            modernUnauthorizedEvent = true
+                            handleSocketFailure(
+                                tvId = tvId,
+                                signal = signal,
+                                context = "socket_unauthorized",
+                                message = "TV rejected pairing/authorization on modern path"
+                            )
+                        } else {
+                            handleSocketFailure(
+                                tvId = tvId,
+                                signal = signal,
+                                context = "socket_error_event",
+                                message = reason.ifBlank {
+                                    "Modern connection failed: TV reported an unexpected socket error"
+                                }
+                            )
+                        }
+                    }
+
+                    else -> {
+                        if (!eventName.isNullOrBlank()) {
+                            diagnosticsTracker.log(
+                                category = DiagnosticsCategory.PROTOCOL,
+                                message = "modern socket event received",
+                                metadata = mapOf(
+                                    "tvId" to tvId,
+                                    "event" to eventName
+                                )
+                            )
+                        }
+                    }
+                }
+
+                if (eventName.isNullOrBlank() && reason.isNotBlank()) {
+                    diagnosticsTracker.log(
+                        category = DiagnosticsCategory.PROTOCOL,
+                        message = "modern socket message without event",
+                        metadata = mapOf(
+                            "tvId" to tvId,
+                            "reason" to reason
+                        )
+                    )
                 }
             }
 
@@ -867,18 +1472,25 @@ class InMemoryTvControlRepository @Inject constructor(
 
                 if (!signal.isCompleted && !readyForCommands) {
                     signal.completeExceptionally(
-                        IllegalStateException("Modern connection closed before ready")
+                        IllegalStateException(
+                            "TV closed the connection before authorization completed. If the TV shows an Allow prompt, accept it and retry."
+                        )
                     )
                     diagnosticsTracker.recordError(
                         context = "socket_closed_before_ready",
-                        errorMessage = "modern connection closed before ready",
-                        metadata = mapOf("tvId" to tvId)
+                        errorMessage = "modern connection closed before ready/authorization (code=$code reason=$reason)",
+                        metadata = mapOf(
+                            "tvId" to tvId,
+                            "closeCode" to code.toString()
+                        )
                     )
                 }
 
                 readyForCommands = false
                 activeSocket = null
                 activeTv = null
+                activeModernSessionId = null
+                activeModernCommandMode = ModernCommandMode.REMOTE_CONTROL
 
                 if (connectionStateFlow.value !is ConnectionState.Error) {
                     connectionStateFlow.value = ConnectionState.Disconnected
@@ -891,13 +1503,67 @@ class InMemoryTvControlRepository @Inject constructor(
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                val rawMessage = t.message ?: "Unknown modern connection failure"
+                val message = if (rawMessage.contains("socket closed", ignoreCase = true)) {
+                    "TV closed the connection before authorization completed. If the TV shows an Allow prompt, accept it and retry."
+                } else {
+                    rawMessage
+                }
+                if (isAuthorizationFailure(message)) {
+                    modernUnauthorizedEvent = true
+                }
                 handleSocketFailure(
                     tvId = tvId,
                     signal = signal,
                     context = "socket_failure",
-                    message = t.message ?: "Unknown modern connection failure"
+                    message = message
                 )
             }
+        }
+    }
+
+    private fun applyModernModeFallbackIfNeeded(
+        tvId: String,
+        reason: String
+    ): Boolean {
+        val normalized = reason.lowercase()
+        val missingSession = normalized.contains("cannot read property 'session' of null")
+        val invalidRemoteControlMethod = normalized.contains("unrecognized method value : ms.remote.control")
+        val invalidChannelEmitMethod = normalized.contains("unrecognized method value : ms.channel.emit")
+
+        return when {
+            invalidRemoteControlMethod -> {
+                activeModernCommandMode = ModernCommandMode.EMIT_KEYPRESS
+                diagnosticsTracker.log(
+                    category = DiagnosticsCategory.PROTOCOL,
+                    message = "modern command mode fallback: remote.control -> ed.keypress",
+                    metadata = mapOf("tvId" to tvId)
+                )
+                true
+            }
+
+            activeModernCommandMode == ModernCommandMode.EMIT_KEYPRESS &&
+                (missingSession || invalidChannelEmitMethod) -> {
+                activeModernCommandMode = ModernCommandMode.EMIT_KEYPRESS_WITH_SESSION
+                diagnosticsTracker.log(
+                    category = DiagnosticsCategory.PROTOCOL,
+                    message = "modern command mode fallback: ed.keypress -> ed.keypress(session)",
+                    metadata = mapOf("tvId" to tvId)
+                )
+                true
+            }
+
+            activeModernCommandMode == ModernCommandMode.EMIT_KEYPRESS_WITH_SESSION && missingSession -> {
+                activeModernCommandMode = ModernCommandMode.EMIT_REMOTE_CONTROL_WITH_SESSION
+                diagnosticsTracker.log(
+                    category = DiagnosticsCategory.PROTOCOL,
+                    message = "modern command mode fallback: ed.keypress(session) -> ed.remote.control(session)",
+                    metadata = mapOf("tvId" to tvId)
+                )
+                true
+            }
+
+            else -> false
         }
     }
 
@@ -913,9 +1579,12 @@ class InMemoryTvControlRepository @Inject constructor(
             signal.completeExceptionally(IllegalStateException(message))
         }
 
+        modernLastErrorMessage = message
         readyForCommands = false
         activeSocket = null
         activeTv = null
+        activeModernSessionId = null
+        activeModernCommandMode = ModernCommandMode.REMOTE_CONTROL
         connectionStateFlow.value = ConnectionState.Error(message)
         diagnosticsTracker.recordError(
             context = context,
@@ -927,8 +1596,11 @@ class InMemoryTvControlRepository @Inject constructor(
     private fun shutdownActiveSocket(setDisconnected: Boolean) {
         activeSocket?.cancel()
         activeSocket = null
+        legacyTcpClient.disconnect()
         activeTv = null
         readyForCommands = false
+        activeModernCommandMode = ModernCommandMode.REMOTE_CONTROL
+        activeModernSessionId = null
         activeTransport = ActiveTransport.MODERN
         activeLegacyPairing = false
         awaitingLegacyFirstCommand = false
@@ -939,27 +1611,105 @@ class InMemoryTvControlRepository @Inject constructor(
         }
     }
 
-    private fun buildModernSocketUrl(ipAddress: String): String {
-        val encodedName = URLEncoder.encode(
-            Base64.encodeToString(
-                MODERN_CLIENT_NAME.toByteArray(StandardCharsets.UTF_8),
-                Base64.NO_WRAP
-            ),
-            StandardCharsets.UTF_8.name()
+    private fun buildModernSocketUrl(
+        ipAddress: String,
+        scheme: String,
+        port: Int,
+        token: String?
+    ): String {
+        val encodedName = Base64.encodeToString(
+            MODERN_CLIENT_NAME.toByteArray(StandardCharsets.UTF_8),
+            Base64.NO_WRAP
         )
 
-        return "ws://$ipAddress:8001/api/v2/channels/samsung.remote.control?name=$encodedName"
+        val tokenQuery = token
+            ?.takeIf { it.isNotBlank() }
+            ?.let { value ->
+                "&token=" + URLEncoder.encode(value, StandardCharsets.UTF_8.name())
+            }
+            .orEmpty()
+        return "$scheme://$ipAddress:$port/api/v2/channels/samsung.remote.control?name=$encodedName$tokenQuery"
     }
 
-    private fun buildRemoteKeyPayload(keyCode: String): String {
+    private fun buildModernKeyPayload(
+        keyCode: String,
+        mode: ModernCommandMode,
+        sessionId: String?
+    ): String {
+        return when (mode) {
+            ModernCommandMode.REMOTE_CONTROL -> buildRemoteControlPayload(keyCode = keyCode)
+
+            ModernCommandMode.EMIT_KEYPRESS -> {
+                buildEmitKeypressPayload(
+                    keyCode = keyCode,
+                    sessionId = null
+                )
+            }
+
+            ModernCommandMode.EMIT_KEYPRESS_WITH_SESSION -> {
+                buildEmitKeypressPayload(
+                    keyCode = keyCode,
+                    sessionId = sessionId
+                )
+            }
+
+            ModernCommandMode.EMIT_REMOTE_CONTROL_WITH_SESSION -> {
+                buildEmitRemoteControlPayload(
+                    keyCode = keyCode,
+                    sessionId = sessionId
+                )
+            }
+        }
+    }
+
+    private fun buildRemoteControlPayload(keyCode: String): String {
         val params = JSONObject()
             .put("Cmd", "Click")
             .put("DataOfCmd", keyCode)
             .put("Option", "false")
             .put("TypeOfRemote", "SendRemoteKey")
-
         return JSONObject()
             .put("method", "ms.remote.control")
+            .put("params", params)
+            .toString()
+    }
+
+    private fun buildEmitKeypressPayload(
+        keyCode: String,
+        sessionId: String?
+    ): String {
+        val data = JSONObject().put("key", keyCode)
+        val params = JSONObject()
+            .put("event", "ed.keypress")
+            .put("to", "host")
+            .put("data", data)
+        if (!sessionId.isNullOrBlank()) {
+            params.put("session", sessionId)
+        }
+        return JSONObject()
+            .put("method", "ms.channel.emit")
+            .put("params", params)
+            .toString()
+    }
+
+    private fun buildEmitRemoteControlPayload(
+        keyCode: String,
+        sessionId: String?
+    ): String {
+        val data = JSONObject()
+            .put("Cmd", "Click")
+            .put("DataOfCmd", keyCode)
+            .put("Option", "false")
+            .put("TypeOfRemote", "SendRemoteKey")
+        val params = JSONObject()
+            .put("event", "ed.remote.control")
+            .put("to", "host")
+            .put("data", data)
+        if (!sessionId.isNullOrBlank()) {
+            params.put("session", sessionId)
+        }
+        return JSONObject()
+            .put("method", "ms.channel.emit")
             .put("params", params)
             .toString()
     }
@@ -976,25 +1726,72 @@ class InMemoryTvControlRepository @Inject constructor(
         }.getOrNull()
     }
 
-    private fun detectProtocol(
-        modelName: String,
-        tokenAuthSupport: String
-    ): TvProtocol {
-        val tokenAuth = tokenAuthSupport.equals("true", ignoreCase = true)
-        if (tokenAuth) {
-            return TvProtocol.MODERN
-        }
+    private fun extractToken(rawMessage: String): String? {
+        return runCatching {
+            val payload = JSONObject(rawMessage)
+            val data = payload.optJSONObject("data") ?: return@runCatching null
 
+            val directToken = data.optString("token").takeIf { it.isNotBlank() }
+            if (directToken != null) {
+                return@runCatching directToken
+            }
+
+            val clients = data.optJSONArray("clients") ?: return@runCatching null
+            for (index in 0 until clients.length()) {
+                val client = clients.optJSONObject(index) ?: continue
+                val token = client.optString("token")
+                if (token.isNotBlank()) {
+                    return@runCatching token
+                }
+            }
+            null
+        }.getOrNull()
+    }
+
+    private fun extractSessionIdentifier(rawMessage: String): String? {
+        return runCatching {
+            val payload = JSONObject(rawMessage)
+            val data = payload.optJSONObject("data") ?: return@runCatching null
+            data.optString("id").takeIf { it.isNotBlank() }
+                ?: run {
+                    val clients = data.optJSONArray("clients") ?: return@run null
+                    for (index in 0 until clients.length()) {
+                        val client = clients.optJSONObject(index) ?: continue
+                        val session = client.optString("id")
+                        if (session.isNotBlank()) {
+                            return@run session
+                        }
+                    }
+                    null
+                }
+        }.getOrNull()
+    }
+
+    private fun extractErrorReason(rawMessage: String): String? {
+        return runCatching {
+            val payload = JSONObject(rawMessage)
+            val data = payload.optJSONObject("data")
+
+            data?.optString("message")?.takeIf { it.isNotBlank() }
+                ?: data?.optString("details")?.takeIf { it.isNotBlank() }
+                ?: payload.optString("message").takeIf { it.isNotBlank() }
+        }.getOrNull()
+    }
+
+    private fun isAuthorizationFailure(message: String): Boolean {
+        val normalized = message.lowercase()
+        return normalized.contains("unauthor")
+            || normalized.contains("forbidden")
+            || normalized.contains("denied")
+            || normalized.contains("reject")
+    }
+
+    private fun isLegacyModel(modelName: String): Boolean {
         val upperModel = modelName.uppercase()
-        val encryptedMarkers = listOf(
+        return listOf(
             "JU", "JS", "J6", "J5", "J4",
             "HU", "HS", "H6", "H5", "H4"
-        )
-        return if (encryptedMarkers.any { marker -> upperModel.contains(marker) }) {
-            TvProtocol.LEGACY_ENCRYPTED
-        } else {
-            TvProtocol.MODERN
-        }
+        ).any { marker -> upperModel.contains(marker) }
     }
 
     private fun pairingIdentifierFor(tv: SamsungTv): String {
@@ -1039,6 +1836,28 @@ class InMemoryTvControlRepository @Inject constructor(
         }
     }
 
+    private fun buildTrustingWsClient(): OkHttpClient {
+        val trustAll = object : X509TrustManager {
+            override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) = Unit
+            override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) = Unit
+            override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+        }
+        val sslContext = SSLContext.getInstance("TLS").apply {
+            init(
+                null,
+                arrayOf<TrustManager>(trustAll),
+                SecureRandom()
+            )
+        }
+        val socketFactory = sslContext.socketFactory
+        val hostnameVerifier = HostnameVerifier { _, _ -> true }
+        return OkHttpClient.Builder()
+            .readTimeout(0, TimeUnit.MILLISECONDS)
+            .sslSocketFactory(socketFactory, trustAll)
+            .hostnameVerifier(hostnameVerifier)
+            .build()
+    }
+
     private fun isOnWifi(): Boolean {
         val manager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val network = manager.activeNetwork ?: return false
@@ -1068,14 +1887,28 @@ class InMemoryTvControlRepository @Inject constructor(
     }
 
     companion object {
-        private const val CONNECTION_READY_TIMEOUT_MS = 6_000L
+        private const val CONNECTION_READY_TIMEOUT_MS = 20_000L
         private const val DISCOVERY_SCAN_TIMEOUT_MS = 4_500L
         private const val RESOLVE_TIMEOUT_MS = 1_500L
-        private const val MODERN_CLIENT_NAME = "Samsung Remote TV Android"
+        private const val PIN_PAGE_RUNNING_CHECK_ATTEMPTS = 8
+        private const val PIN_PAGE_RUNNING_CHECK_INTERVAL_MS = 250L
+        private const val SUBNET_DISCOVERY_CONCURRENCY = 36
+        private const val SUBNET_PROBE_PORT_TIMEOUT_MS = 250
+        private const val MODERN_CLIENT_NAME = "SamsungTVRemote"
+        private val LEGACY_REMOTE_PORTS = listOf(55_000, 55_001, 52_235)
 
         private const val EVENT_CHANNEL_CONNECT = "ms.channel.connect"
+        private const val EVENT_CHANNEL_CLIENT_CONNECT = "ms.channel.clientConnect"
         private const val EVENT_CHANNEL_READY = "ms.channel.ready"
         private const val EVENT_CHANNEL_UNAUTHORIZED = "ms.channel.unauthorized"
+        private const val EVENT_CHANNEL_ERROR = "ms.error"
+
+        private val NSD_SERVICE_TYPES = listOf(
+            "_samsungctl._tcp",
+            "_samsung-multiscreen._tcp",
+            "_samsungmsf._tcp",
+            "_mediaremotetv._tcp"
+        )
 
         private val DEFAULT_CAPABILITIES = setOf(
             TvCapability.D_PAD,
@@ -1089,6 +1922,10 @@ class InMemoryTvControlRepository @Inject constructor(
 
 internal fun modernKeyCodeFor(key: RemoteKey): String? {
     return when (key) {
+        RemoteKey.HOME -> "KEY_HOME"
+        RemoteKey.BACK -> "KEY_RETURN"
+        RemoteKey.EXIT -> "KEY_EXIT"
+        RemoteKey.MENU -> "KEY_MENU"
         RemoteKey.D_PAD_UP -> "KEY_UP"
         RemoteKey.D_PAD_DOWN -> "KEY_DOWN"
         RemoteKey.D_PAD_LEFT -> "KEY_LEFT"
@@ -1098,6 +1935,25 @@ internal fun modernKeyCodeFor(key: RemoteKey): String? {
         RemoteKey.VOLUME_DOWN -> "KEY_VOLDOWN"
         RemoteKey.MUTE -> "KEY_MUTE"
         RemoteKey.MEDIA_PLAY_PAUSE -> "KEY_PLAY_PAUSE"
+        RemoteKey.POWER -> "KEY_POWER"
+    }
+}
+
+internal fun legacyKeyCodeFor(key: RemoteKey): String? {
+    return when (key) {
+        RemoteKey.HOME -> "KEY_HOME"
+        RemoteKey.BACK -> "KEY_RETURN"
+        RemoteKey.EXIT -> "KEY_EXIT"
+        RemoteKey.MENU -> "KEY_MENU"
+        RemoteKey.D_PAD_UP -> "KEY_UP"
+        RemoteKey.D_PAD_DOWN -> "KEY_DOWN"
+        RemoteKey.D_PAD_LEFT -> "KEY_LEFT"
+        RemoteKey.D_PAD_RIGHT -> "KEY_RIGHT"
+        RemoteKey.OK -> "KEY_ENTER"
+        RemoteKey.VOLUME_UP -> "KEY_VOLUP"
+        RemoteKey.VOLUME_DOWN -> "KEY_VOLDOWN"
+        RemoteKey.MUTE -> "KEY_MUTE"
+        RemoteKey.MEDIA_PLAY_PAUSE -> "KEY_PLAY"
         RemoteKey.POWER -> "KEY_POWER"
     }
 }

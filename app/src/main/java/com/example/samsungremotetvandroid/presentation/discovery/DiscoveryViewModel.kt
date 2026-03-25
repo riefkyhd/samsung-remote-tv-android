@@ -43,7 +43,7 @@ class DiscoveryViewModel @Inject constructor(
     }
 
     fun refreshDiscovery() {
-        if (uiStateFlow.value.isScanning) {
+        if (uiStateFlow.value.isScanning || uiStateFlow.value.isConnecting) {
             return
         }
 
@@ -82,6 +82,9 @@ class DiscoveryViewModel @Inject constructor(
     }
 
     fun openManualIpDialog() {
+        if (uiStateFlow.value.isConnecting) {
+            return
+        }
         uiStateFlow.update { current ->
             current.copy(showManualIpDialog = true)
         }
@@ -106,6 +109,9 @@ class DiscoveryViewModel @Inject constructor(
     }
 
     fun submitManualIp(onConnected: () -> Unit = {}) {
+        if (uiStateFlow.value.isConnecting) {
+            return
+        }
         val trimmed = uiStateFlow.value.manualIpAddress.trim()
 
         if (trimmed.isEmpty()) {
@@ -128,6 +134,7 @@ class DiscoveryViewModel @Inject constructor(
         }
 
         viewModelScope.launch {
+            setConnecting(tvId = "manual_$trimmed")
             val discoveredTv = runCatching {
                 scanManualIpUseCase(trimmed)
             }.getOrElse { error ->
@@ -138,6 +145,7 @@ class DiscoveryViewModel @Inject constructor(
                     metadata = mapOf("ipAddress" to trimmed)
                 )
                 showMessage(error.message ?: "Could not reach a compatible Samsung TV at that IP.")
+                setConnecting(tvId = null)
                 return@launch
             }
 
@@ -153,12 +161,16 @@ class DiscoveryViewModel @Inject constructor(
     }
 
     fun connect(tvId: String, onConnected: () -> Unit = {}) {
+        if (uiStateFlow.value.isConnecting) {
+            return
+        }
         viewModelScope.launch {
             connectToTv(tvId, onConnected)
         }
     }
 
     private suspend fun connectToTv(tvId: String, onConnected: () -> Unit) {
+        setConnecting(tvId)
         diagnosticsTracker.log(
             category = DiagnosticsCategory.RECONNECT,
             message = "discovery connect requested",
@@ -175,6 +187,7 @@ class DiscoveryViewModel @Inject constructor(
                 metadata = mapOf("tvId" to tvId)
             )
             showMessage(connectError.message ?: "Unable to connect to this TV right now.")
+            setConnecting(tvId = null)
             return
         }
 
@@ -183,6 +196,17 @@ class DiscoveryViewModel @Inject constructor(
                 diagnosticsTracker.log(
                     category = DiagnosticsCategory.LIFECYCLE,
                     message = "discovery connect ready",
+                    metadata = mapOf("tvId" to tvId)
+                )
+                onConnected()
+            }
+
+            is ConnectionState.ConnectedNotReady,
+            is ConnectionState.Pairing,
+            is ConnectionState.PinRequired -> {
+                diagnosticsTracker.log(
+                    category = DiagnosticsCategory.LIFECYCLE,
+                    message = "discovery connect transitioned to non-ready remote state",
                     metadata = mapOf("tvId" to tvId)
                 )
                 onConnected()
@@ -199,6 +223,7 @@ class DiscoveryViewModel @Inject constructor(
 
             else -> Unit
         }
+        setConnecting(tvId = null)
     }
 
     private fun showMessage(message: String) {
@@ -206,10 +231,21 @@ class DiscoveryViewModel @Inject constructor(
             current.copy(message = message)
         }
     }
+
+    private fun setConnecting(tvId: String?) {
+        uiStateFlow.update { current ->
+            current.copy(
+                isConnecting = tvId != null,
+                connectingTvId = tvId
+            )
+        }
+    }
 }
 
 data class DiscoveryUiState(
     val isScanning: Boolean = false,
+    val isConnecting: Boolean = false,
+    val connectingTvId: String? = null,
     val hasScanned: Boolean = false,
     val showManualIpDialog: Boolean = false,
     val manualIpAddress: String = "",

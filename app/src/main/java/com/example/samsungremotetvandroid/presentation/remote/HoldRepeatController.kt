@@ -3,6 +3,7 @@ package com.example.samsungremotetvandroid.presentation.remote
 import com.example.samsungremotetvandroid.domain.model.ConnectionState
 import com.example.samsungremotetvandroid.domain.model.RemoteKey
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
@@ -26,7 +27,7 @@ internal class HoldRepeatController(
             }
         }
 
-        val job = scope.launch {
+        val job = scope.launch(start = CoroutineStart.UNDISPATCHED) {
             onSend(key)
             delay(initialDelayMs)
             while (isActive) {

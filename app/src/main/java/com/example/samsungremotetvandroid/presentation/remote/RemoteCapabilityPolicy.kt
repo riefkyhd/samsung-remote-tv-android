@@ -9,6 +9,10 @@ internal const val QUICK_LAUNCH_UNAVAILABLE_MESSAGE =
 
 internal fun capabilityForKey(key: RemoteKey): TvCapability? {
     return when (key) {
+        RemoteKey.HOME,
+        RemoteKey.BACK,
+        RemoteKey.EXIT,
+        RemoteKey.MENU,
         RemoteKey.D_PAD_UP,
         RemoteKey.D_PAD_DOWN,
         RemoteKey.D_PAD_LEFT,

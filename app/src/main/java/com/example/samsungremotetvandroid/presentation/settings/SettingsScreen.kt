@@ -8,8 +8,12 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.ArrowBack
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -27,6 +31,7 @@ import com.example.samsungremotetvandroid.presentation.common.SecondaryActionBut
 
 @Composable
 fun SettingsScreen(
+    onBack: () -> Unit = {},
     viewModel: SettingsViewModel = hiltViewModel()
 ) {
     val savedTvs by viewModel.savedTvs.collectAsStateWithLifecycle()
@@ -39,10 +44,22 @@ fun SettingsScreen(
         verticalArrangement = Arrangement.spacedBy(SamsungSpacing.SpacingMd)
     ) {
         item {
-            Text(
-                text = stringResource(id = R.string.nav_settings),
-                style = MaterialTheme.typography.headlineMedium
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(SamsungSpacing.SpacingSm)
+            ) {
+                IconButton(onClick = onBack) {
+                    Icon(
+                        imageVector = Icons.Outlined.ArrowBack,
+                        contentDescription = stringResource(id = R.string.common_back)
+                    )
+                }
+                Text(
+                    text = stringResource(id = R.string.nav_settings),
+                    style = MaterialTheme.typography.headlineMedium,
+                    modifier = Modifier.padding(top = SamsungSpacing.SpacingXs)
+                )
+            }
         }
 
         item {

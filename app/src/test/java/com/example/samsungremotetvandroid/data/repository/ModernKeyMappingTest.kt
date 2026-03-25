@@ -7,6 +7,10 @@ import org.junit.Test
 class ModernKeyMappingTest {
     @Test
     fun modernKeyCodeFor_mapsExpectedRemoteKeys() {
+        assertEquals("KEY_HOME", modernKeyCodeFor(RemoteKey.HOME))
+        assertEquals("KEY_RETURN", modernKeyCodeFor(RemoteKey.BACK))
+        assertEquals("KEY_EXIT", modernKeyCodeFor(RemoteKey.EXIT))
+        assertEquals("KEY_MENU", modernKeyCodeFor(RemoteKey.MENU))
         assertEquals("KEY_UP", modernKeyCodeFor(RemoteKey.D_PAD_UP))
         assertEquals("KEY_DOWN", modernKeyCodeFor(RemoteKey.D_PAD_DOWN))
         assertEquals("KEY_LEFT", modernKeyCodeFor(RemoteKey.D_PAD_LEFT))

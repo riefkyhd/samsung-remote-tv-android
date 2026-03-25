@@ -6,6 +6,7 @@ import com.example.samsungremotetvandroid.core.diagnostics.DiagnosticsCategory
 import com.example.samsungremotetvandroid.core.diagnostics.DiagnosticsTracker
 import com.example.samsungremotetvandroid.domain.model.ConnectionState
 import com.example.samsungremotetvandroid.domain.model.RemoteKey
+import com.example.samsungremotetvandroid.domain.model.SamsungTv
 import com.example.samsungremotetvandroid.domain.model.TvCapability
 import com.example.samsungremotetvandroid.domain.usecase.ObserveDiscoveredTvsUseCase
 import com.example.samsungremotetvandroid.domain.usecase.CancelEncryptedPairingUseCase
@@ -43,6 +44,8 @@ class RemoteViewModel @Inject constructor(
     val savedTvs = observeSavedTvsUseCase()
     val discoveredTvs = observeDiscoveredTvsUseCase()
     private val connectAttemptsFlow = MutableStateFlow(0)
+    private val connectInFlightFlow = MutableStateFlow(false)
+    private val selectedTvIdFlow = MutableStateFlow<String?>(null)
     private val pendingPinFlow = MutableStateFlow("")
     private val userMessageFlow = MutableStateFlow<String?>(null)
     private val holdRepeater = HoldRepeatController(
@@ -55,6 +58,15 @@ class RemoteViewModel @Inject constructor(
 
     val diagnosticsEvents = diagnosticsTracker.recentEvents
     val lastErrorSummary = diagnosticsTracker.lastErrorSummary
+    val connectInFlight: StateFlow<Boolean> = connectInFlightFlow.asStateFlow()
+    val selectedTvId: StateFlow<String?> = selectedTvIdFlow.asStateFlow()
+    val availableTvs: StateFlow<List<SamsungTv>> = combine(savedTvs, discoveredTvs) { saved, discovered ->
+        mergeAvailableTvs(saved = saved, discovered = discovered)
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5_000L),
+        initialValue = emptyList()
+    )
     val pendingPin: StateFlow<String> = pendingPinFlow.asStateFlow()
     val userMessage: StateFlow<String?> = userMessageFlow.asStateFlow()
     val diagnosticsSummary = combine(
@@ -77,15 +89,42 @@ class RemoteViewModel @Inject constructor(
                 }
             }
         }
+
+        viewModelScope.launch {
+            combine(availableTvs, connectionState) { tvs, state ->
+                Pair(tvs, activeTvId(state))
+            }.collectLatest { (tvs, activeConnectionTvId) ->
+                val selectedTvId = selectedTvIdFlow.value
+                val nextSelection = when {
+                    selectedTvId != null && tvs.any { it.id == selectedTvId } -> selectedTvId
+                    activeConnectionTvId != null && tvs.any { it.id == activeConnectionTvId } -> activeConnectionTvId
+                    tvs.isNotEmpty() -> tvs.first().id
+                    else -> null
+                }
+                selectedTvIdFlow.value = nextSelection
+            }
+        }
     }
 
-    fun connectFirstSavedTv() {
+    fun selectTv(tvId: String) {
+        val exists = availableTvs.value.any { tv -> tv.id == tvId }
+        if (!exists) {
+            return
+        }
+        selectedTvIdFlow.value = tvId
+    }
+
+    fun connectSelectedTv() {
+        if (connectInFlightFlow.value) {
+            return
+        }
         holdRepeater.stopAll()
-        val tvId = savedTvs.value.firstOrNull()?.id ?: run {
+        val tvId = selectedTvIdFlow.value ?: run {
             diagnosticsTracker.recordError(
                 context = "remote_connect",
-                errorMessage = "no saved tv available to connect"
+                errorMessage = "no target tv selected for remote connect"
             )
+            showUserMessage("Pick a TV from Discovery first.")
             return
         }
         connectAttemptsFlow.update { attempts -> attempts + 1 }
@@ -94,6 +133,7 @@ class RemoteViewModel @Inject constructor(
             message = "remote connect requested",
             metadata = mapOf("tvId" to tvId)
         )
+        connectInFlightFlow.value = true
         viewModelScope.launch {
             runCatching {
                 connectToTvUseCase(tvId)
@@ -103,6 +143,14 @@ class RemoteViewModel @Inject constructor(
                     errorMessage = error.message ?: "failed to connect requested tv",
                     metadata = mapOf("tvId" to tvId)
                 )
+                showUserMessage(error.message ?: "Unable to connect to this TV right now.")
+            }.onSuccess {
+                val state = connectionState.value
+                if (state is ConnectionState.Error) {
+                    showUserMessage(state.message)
+                }
+            }.also {
+                connectInFlightFlow.value = false
             }
         }
     }
@@ -121,6 +169,8 @@ class RemoteViewModel @Inject constructor(
                     context = "remote_disconnect",
                     errorMessage = error.message ?: "failed to disconnect"
                 )
+            }.also {
+                connectInFlightFlow.value = false
             }
         }
     }
@@ -172,6 +222,9 @@ class RemoteViewModel @Inject constructor(
     }
 
     fun submitEncryptedPin() {
+        if (connectInFlightFlow.value) {
+            return
+        }
         val state = connectionState.value as? ConnectionState.PinRequired ?: run {
             diagnosticsTracker.recordError(
                 context = "submit_encrypted_pin",
@@ -181,6 +234,7 @@ class RemoteViewModel @Inject constructor(
         }
 
         val pin = pendingPinFlow.value.trim()
+        connectInFlightFlow.value = true
         viewModelScope.launch {
             runCatching {
                 completeEncryptedPairingUseCase(
@@ -194,6 +248,8 @@ class RemoteViewModel @Inject constructor(
                     errorMessage = error.message ?: "failed to complete encrypted pairing",
                     metadata = mapOf("tvId" to state.tvId)
                 )
+            }.also {
+                connectInFlightFlow.value = false
             }
         }
     }
@@ -220,6 +276,16 @@ class RemoteViewModel @Inject constructor(
     }
 
     private suspend fun sendRemoteKeyInternal(key: RemoteKey) {
+        if (connectionState.value !is ConnectionState.Ready) {
+            val message = "Remote controls are locked until this TV is ready."
+            showUserMessage(message)
+            diagnosticsTracker.recordError(
+                context = "remote_send_key_blocked",
+                errorMessage = message,
+                metadata = mapOf("key" to key.name)
+            )
+            return
+        }
         if (!isRemoteKeySupported(key)) {
             return
         }
@@ -255,7 +321,7 @@ class RemoteViewModel @Inject constructor(
     }
 
     private fun activeTvCapabilities(): Set<TvCapability>? {
-        val tvId = activeTvId(connectionState.value) ?: return null
+        val tvId = activeTvId(connectionState.value) ?: selectedTvIdFlow.value ?: return null
         return savedTvs.value.firstOrNull { it.id == tvId }?.capabilities
             ?: discoveredTvs.value.firstOrNull { it.id == tvId }?.capabilities
     }
@@ -274,6 +340,17 @@ class RemoteViewModel @Inject constructor(
             is ConnectionState.Ready -> "Ready"
             is ConnectionState.Error -> "Error"
         }
+    }
+
+    private fun mergeAvailableTvs(saved: List<SamsungTv>, discovered: List<SamsungTv>): List<SamsungTv> {
+        val byIp = linkedMapOf<String, SamsungTv>()
+        saved.forEach { tv -> byIp[tv.ipAddress] = tv }
+        discovered.forEach { tv ->
+            if (byIp.containsKey(tv.ipAddress).not()) {
+                byIp[tv.ipAddress] = tv
+            }
+        }
+        return byIp.values.toList()
     }
 
     private companion object {

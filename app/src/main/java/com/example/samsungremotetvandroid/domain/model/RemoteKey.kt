@@ -1,6 +1,10 @@
 package com.example.samsungremotetvandroid.domain.model
 
 enum class RemoteKey {
+    HOME,
+    BACK,
+    EXIT,
+    MENU,
     D_PAD_UP,
     D_PAD_DOWN,
     D_PAD_LEFT,

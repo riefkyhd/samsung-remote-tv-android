@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">Samsung Remote TV Android</string>
+    <string name="app_name">Samsung TV Remote</string>
     <string name="nav_discovery">Discovery</string>
     <string name="nav_remote">Remote</string>
     <string name="nav_settings">Settings</string>
@@ -17,10 +17,11 @@
     <string name="discovery_no_new">No new TVs found on this scan.</string>
     <string name="discovery_manual_title">Add TV by IP</string>
     <string name="discovery_manual_ip_label">IP Address</string>
-    <string name="discovery_manual_ip_placeholder">192.168.1.20</string>
+    <string name="discovery_manual_ip_placeholder">192.168.100.21</string>
     <string name="common_open">Open</string>
     <string name="common_connect">Connect</string>
     <string name="common_cancel">Cancel</string>
+    <string name="common_back">Back</string>
     <string name="common_error">Error</string>
     <string name="common_ok">OK</string>
     <string name="settings_intro">Forget Pairing clears saved pairing data. Remove Device also deletes the saved TV entry.</string>
@@ -49,4 +50,32 @@
     <string name="remote_quick_launch_note">Quick Launch remains curated shortcuts, not installed-app enumeration.</string>
     <string name="remote_quick_launch_unavailable_label">Quick Launch (Unavailable)</string>
     <string name="remote_installed_app_unsupported_note">Installed-app browsing/enumeration is unsupported in this Android baseline.</string>
+    <string name="remote_title">Remote</string>
+    <string name="remote_open_discovery">Devices</string>
+    <string name="remote_open_settings">Settings</string>
+    <string name="remote_connecting_button">Connecting…</string>
+    <string name="remote_connection_state_title">Connection State</string>
+    <string name="remote_connection_truthfulness_note">Connected is distinct from Ready to keep state truthful.</string>
+    <string name="remote_controls_ready_hint">Remote controls are ready.</string>
+    <string name="remote_controls_locked_hint">Remote controls stay locked until the selected TV reaches Ready.</string>
+    <string name="remote_connect_button">Connect</string>
+    <string name="remote_disconnect_button">Disconnect</string>
+    <string name="remote_controls_title">Controls</string>
+    <string name="remote_dpad_up">Up</string>
+    <string name="remote_dpad_left">Left</string>
+    <string name="remote_dpad_ok">OK</string>
+    <string name="remote_dpad_right">Right</string>
+    <string name="remote_dpad_down">Down</string>
+    <string name="remote_volume_media_power_title">Volume / Media / Power</string>
+    <string name="remote_volume_plus">Vol +</string>
+    <string name="remote_volume_minus">Vol -</string>
+    <string name="remote_play_pause">Play / Pause</string>
+    <string name="remote_header_target">Target: %1$s</string>
+    <string name="remote_header_no_target">Select a TV from Devices to start controlling.</string>
+    <string name="remote_target_tv_title">Target TV</string>
+    <string name="remote_target_tv_empty">No saved or discovered TVs. Use Discovery first.</string>
+    <string name="remote_target_tv_selected">Selected</string>
+    <string name="remote_target_tv_use">Use</string>
+    <string name="discovery_connecting_hint">Connecting to TV… controls stay locked until the connection is ready.</string>
+    <string name="discovery_connecting_label">Connecting…</string>
 </resources>
