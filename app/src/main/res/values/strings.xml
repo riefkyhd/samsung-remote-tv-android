@@ -35,4 +35,8 @@
     <string name="settings_device_removed_title">Device Removed</string>
     <string name="settings_device_removed_success">Saved TV and pairing data were removed.</string>
     <string name="settings_action_failed">Action failed. Please try again.</string>
+    <string name="remote_diagnostics_title">Diagnostics</string>
+    <string name="remote_diagnostics_last_error">Last Error: %1$s</string>
+    <string name="remote_diagnostics_none">none</string>
+    <string name="remote_diagnostics_empty">No diagnostics yet.</string>
 </resources>

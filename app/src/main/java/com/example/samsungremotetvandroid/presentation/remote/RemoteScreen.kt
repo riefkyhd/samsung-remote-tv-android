@@ -1,5 +1,6 @@
 package com.example.samsungremotetvandroid.presentation.remote
 
+import android.content.pm.ApplicationInfo
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -12,9 +13,13 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.samsungremotetvandroid.R
 import com.example.samsungremotetvandroid.core.design.SamsungSpacing
 import com.example.samsungremotetvandroid.domain.model.ConnectionState
 import com.example.samsungremotetvandroid.domain.model.RemoteKey
@@ -26,6 +31,11 @@ fun RemoteScreen(
     viewModel: RemoteViewModel = hiltViewModel()
 ) {
     val connectionState by viewModel.connectionState.collectAsStateWithLifecycle()
+    val diagnosticsSummary by viewModel.diagnosticsSummary.collectAsStateWithLifecycle()
+    val diagnosticsEvents by viewModel.diagnosticsEvents.collectAsStateWithLifecycle()
+    val lastErrorSummary by viewModel.lastErrorSummary.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+    val isDebuggable = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
 
     Column(
         modifier = Modifier
@@ -151,6 +161,50 @@ fun RemoteScreen(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Start
         )
+
+        if (isDebuggable) {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(
+                    modifier = Modifier.padding(SamsungSpacing.SpacingMd),
+                    verticalArrangement = Arrangement.spacedBy(SamsungSpacing.SpacingSm)
+                ) {
+                    Text(
+                        text = stringResource(id = R.string.remote_diagnostics_title),
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Text(
+                        text = diagnosticsSummary,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    Text(
+                        text = stringResource(
+                            id = R.string.remote_diagnostics_last_error,
+                            lastErrorSummary ?: stringResource(id = R.string.remote_diagnostics_none)
+                        ),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    val recentEvents = diagnosticsEvents.takeLast(8)
+                    if (recentEvents.isEmpty()) {
+                        Text(
+                            text = stringResource(id = R.string.remote_diagnostics_empty),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else {
+                        recentEvents.forEach { event ->
+                            Text(
+                                text = event,
+                                style = MaterialTheme.typography.bodySmall,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

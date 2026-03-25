@@ -6,6 +6,8 @@ import android.net.NetworkCapabilities
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.util.Base64
+import com.example.samsungremotetvandroid.core.diagnostics.DiagnosticsCategory
+import com.example.samsungremotetvandroid.core.diagnostics.DiagnosticsTracker
 import com.example.samsungremotetvandroid.domain.model.ConnectionState
 import com.example.samsungremotetvandroid.domain.model.QuickLaunchShortcut
 import com.example.samsungremotetvandroid.domain.model.RemoteKey
@@ -41,7 +43,8 @@ import org.json.JSONObject
 
 @Singleton
 class InMemoryTvControlRepository @Inject constructor(
-    @ApplicationContext private val context: Context
+    @ApplicationContext private val context: Context,
+    private val diagnosticsTracker: DiagnosticsTracker
 ) : TvControlRepository {
     private val wsClient = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
@@ -88,8 +91,17 @@ class InMemoryTvControlRepository @Inject constructor(
 
     override suspend fun scanDiscovery() {
         discoveryMutex.withLock {
+            diagnosticsTracker.log(
+                category = DiagnosticsCategory.LIFECYCLE,
+                message = "discovery scan requested"
+            )
+
             if (!isOnWifi()) {
                 discoveredTvsState.value = emptyList()
+                diagnosticsTracker.recordError(
+                    context = "scan_discovery",
+                    errorMessage = "discovery skipped: not on wifi"
+                )
                 return
             }
 
@@ -115,40 +127,90 @@ class InMemoryTvControlRepository @Inject constructor(
             }
 
             discoveredTvsState.value = foundByIp.values.toList()
+            diagnosticsTracker.log(
+                category = DiagnosticsCategory.LIFECYCLE,
+                message = "discovery scan completed",
+                metadata = mapOf("discoveredCount" to foundByIp.size.toString())
+            )
         }
     }
 
     override suspend fun scanManualIp(ipAddress: String): SamsungTv {
         val normalizedIp = ipAddress.trim()
+        diagnosticsTracker.log(
+            category = DiagnosticsCategory.LIFECYCLE,
+            message = "manual ip scan requested",
+            metadata = mapOf("ipAddress" to normalizedIp)
+        )
 
         if (!isOnWifi()) {
+            diagnosticsTracker.recordError(
+                context = "scan_manual_ip",
+                errorMessage = "manual ip scan blocked: not on wifi",
+                metadata = mapOf("ipAddress" to normalizedIp)
+            )
             throw IllegalStateException("Connect to Wi-Fi, then try again.")
         }
 
         val tv = fetchModernTvInfo(normalizedIp)
-            ?: throw IllegalStateException("Could not reach a compatible Samsung TV at that IP.")
+            ?: run {
+                diagnosticsTracker.recordError(
+                    context = "scan_manual_ip",
+                    errorMessage = "manual ip scan failed to match compatible tv",
+                    metadata = mapOf("ipAddress" to normalizedIp)
+                )
+                throw IllegalStateException("Could not reach a compatible Samsung TV at that IP.")
+            }
 
         discoveredTvsState.update { existing ->
             val withoutSameIp = existing.filterNot { it.ipAddress == tv.ipAddress }
             listOf(tv) + withoutSameIp
         }
 
+        diagnosticsTracker.log(
+            category = DiagnosticsCategory.LIFECYCLE,
+            message = "manual ip scan matched tv",
+            metadata = mapOf(
+                "tvId" to tv.id,
+                "ipAddress" to tv.ipAddress
+            )
+        )
+
         return tv
     }
 
     override suspend fun connect(tvId: String) {
+        diagnosticsTracker.log(
+            category = DiagnosticsCategory.RECONNECT,
+            message = "connect requested",
+            metadata = mapOf("tvId" to tvId)
+        )
+
         val savedTv = savedTvsState.value.firstOrNull { it.id == tvId }
         val discoveredTv = discoveredTvsState.value.firstOrNull { it.id == tvId }
         val tv = savedTv ?: discoveredTv
 
         if (tv == null) {
             connectionStateFlow.value = ConnectionState.Error("Unable to connect: TV not found")
+            diagnosticsTracker.recordError(
+                context = "connect_tv_not_found",
+                errorMessage = "unable to connect because tv was not found",
+                metadata = mapOf("tvId" to tvId)
+            )
             return
         }
 
         if (tv.protocol != TvProtocol.MODERN) {
             connectionStateFlow.value = ConnectionState.Error(
                 "Only the modern TV path is available in this phase"
+            )
+            diagnosticsTracker.recordError(
+                context = "connect_unsupported_protocol",
+                errorMessage = "connect blocked because protocol is unsupported in this phase",
+                metadata = mapOf(
+                    "tvId" to tv.id,
+                    "protocol" to tv.protocol.name
+                )
             )
             return
         }
@@ -158,6 +220,11 @@ class InMemoryTvControlRepository @Inject constructor(
         connectionMutex.withLock {
             shutdownActiveSocket(setDisconnected = false)
             connectionStateFlow.value = ConnectionState.Connecting
+            diagnosticsTracker.log(
+                category = DiagnosticsCategory.RECONNECT,
+                message = "connecting",
+                metadata = mapOf("tvId" to tv.id)
+            )
 
             val signal = CompletableDeferred<Unit>()
             readySignal = signal
@@ -186,6 +253,11 @@ class InMemoryTvControlRepository @Inject constructor(
                     connectionStateFlow.value = ConnectionState.Error(
                         "Modern connection opened but did not become ready in time"
                     )
+                    diagnosticsTracker.recordError(
+                        context = "connect_ready_timeout",
+                        errorMessage = "modern connection did not become ready in time",
+                        metadata = mapOf("tvId" to tv.id)
+                    )
                 }
                 shutdownActiveSocket(setDisconnected = false)
             } finally {
@@ -197,6 +269,10 @@ class InMemoryTvControlRepository @Inject constructor(
     }
 
     override suspend fun disconnect() {
+        diagnosticsTracker.log(
+            category = DiagnosticsCategory.LIFECYCLE,
+            message = "disconnect requested"
+        )
         connectionMutex.withLock {
             readySignal?.cancel()
             readySignal = null
@@ -209,6 +285,11 @@ class InMemoryTvControlRepository @Inject constructor(
             connectionStateFlow.value = ConnectionState.Error(
                 "Remote input is unavailable until the TV is ready"
             )
+            diagnosticsTracker.recordError(
+                context = "send_key_not_ready",
+                errorMessage = "remote key blocked because connection is not ready",
+                metadata = mapOf("key" to key.name)
+            )
             return
         }
 
@@ -216,6 +297,11 @@ class InMemoryTvControlRepository @Inject constructor(
         if (keyCode == null) {
             connectionStateFlow.value = ConnectionState.Error(
                 "Unsupported key for modern path: $key"
+            )
+            diagnosticsTracker.recordError(
+                context = "send_key_unsupported",
+                errorMessage = "unsupported key for modern transport",
+                metadata = mapOf("key" to key.name)
             )
             return
         }
@@ -225,6 +311,11 @@ class InMemoryTvControlRepository @Inject constructor(
             connectionStateFlow.value = ConnectionState.Error(
                 "Failed to send remote key on modern path"
             )
+            diagnosticsTracker.recordError(
+                context = "send_key_failed",
+                errorMessage = "failed to send key over modern socket",
+                metadata = mapOf("keyCode" to keyCode)
+            )
         }
     }
 
@@ -232,9 +323,22 @@ class InMemoryTvControlRepository @Inject constructor(
         connectionStateFlow.value = ConnectionState.Error(
             "Quick Launch transport is not implemented in this modern baseline"
         )
+        diagnosticsTracker.log(
+            category = DiagnosticsCategory.CAPABILITIES,
+            message = "quick launch transport not implemented",
+            metadata = mapOf(
+                "tvId" to tvId,
+                "shortcut" to shortcut.title
+            )
+        )
     }
 
     override suspend fun forgetPairing(tvId: String) {
+        diagnosticsTracker.log(
+            category = DiagnosticsCategory.PAIRING,
+            message = "forget pairing requested",
+            metadata = mapOf("tvId" to tvId)
+        )
         val activeTvId = activeTv?.id
         if (activeTvId == tvId) {
             disconnect()
@@ -242,6 +346,11 @@ class InMemoryTvControlRepository @Inject constructor(
     }
 
     override suspend fun removeDevice(tvId: String) {
+        diagnosticsTracker.log(
+            category = DiagnosticsCategory.LIFECYCLE,
+            message = "remove device requested",
+            metadata = mapOf("tvId" to tvId)
+        )
         val activeTvId = activeTv?.id
         val removedIp = savedTvsState.value.firstOrNull { it.id == tvId }?.ipAddress
 
@@ -267,6 +376,11 @@ class InMemoryTvControlRepository @Inject constructor(
                 if (tv.id == tvId) tv.copy(displayName = normalizedName) else tv
             }
         }
+        diagnosticsTracker.log(
+            category = DiagnosticsCategory.LIFECYCLE,
+            message = "rename tv requested",
+            metadata = mapOf("tvId" to tvId)
+        )
     }
 
     private suspend fun discoverServices(serviceType: String): List<NsdServiceInfo> {
@@ -438,6 +552,11 @@ class InMemoryTvControlRepository @Inject constructor(
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 if (activeTv?.id != tvId) return
                 connectionStateFlow.value = ConnectionState.ConnectedNotReady(tvId)
+                diagnosticsTracker.log(
+                    category = DiagnosticsCategory.LIFECYCLE,
+                    message = "modern socket opened",
+                    metadata = mapOf("tvId" to tvId)
+                )
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -448,6 +567,11 @@ class InMemoryTvControlRepository @Inject constructor(
                     EVENT_CHANNEL_READY -> {
                         readyForCommands = true
                         connectionStateFlow.value = ConnectionState.Ready(tvId)
+                        diagnosticsTracker.log(
+                            category = DiagnosticsCategory.LIFECYCLE,
+                            message = "modern channel is ready",
+                            metadata = mapOf("tvId" to tvId)
+                        )
                         if (!signal.isCompleted) {
                             signal.complete(Unit)
                         }
@@ -457,6 +581,7 @@ class InMemoryTvControlRepository @Inject constructor(
                         handleSocketFailure(
                             tvId = tvId,
                             signal = signal,
+                            context = "socket_unauthorized",
                             message = "TV rejected pairing/authorization on modern path"
                         )
                     }
@@ -474,6 +599,11 @@ class InMemoryTvControlRepository @Inject constructor(
                     signal.completeExceptionally(
                         IllegalStateException("Modern connection closed before ready")
                     )
+                    diagnosticsTracker.recordError(
+                        context = "socket_closed_before_ready",
+                        errorMessage = "modern connection closed before ready",
+                        metadata = mapOf("tvId" to tvId)
+                    )
                 }
 
                 readyForCommands = false
@@ -482,6 +612,11 @@ class InMemoryTvControlRepository @Inject constructor(
 
                 if (connectionStateFlow.value !is ConnectionState.Error) {
                     connectionStateFlow.value = ConnectionState.Disconnected
+                    diagnosticsTracker.log(
+                        category = DiagnosticsCategory.LIFECYCLE,
+                        message = "modern socket closed",
+                        metadata = mapOf("tvId" to tvId)
+                    )
                 }
             }
 
@@ -489,6 +624,7 @@ class InMemoryTvControlRepository @Inject constructor(
                 handleSocketFailure(
                     tvId = tvId,
                     signal = signal,
+                    context = "socket_failure",
                     message = t.message ?: "Unknown modern connection failure"
                 )
             }
@@ -498,6 +634,7 @@ class InMemoryTvControlRepository @Inject constructor(
     private fun handleSocketFailure(
         tvId: String,
         signal: CompletableDeferred<Unit>,
+        context: String,
         message: String
     ) {
         if (activeTv?.id != tvId) return
@@ -510,6 +647,11 @@ class InMemoryTvControlRepository @Inject constructor(
         activeSocket = null
         activeTv = null
         connectionStateFlow.value = ConnectionState.Error(message)
+        diagnosticsTracker.recordError(
+            context = context,
+            errorMessage = message,
+            metadata = mapOf("tvId" to tvId)
+        )
     }
 
     private fun shutdownActiveSocket(setDisconnected: Boolean) {

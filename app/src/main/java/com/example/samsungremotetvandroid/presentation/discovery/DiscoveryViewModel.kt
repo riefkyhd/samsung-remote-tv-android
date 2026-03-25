@@ -2,6 +2,8 @@ package com.example.samsungremotetvandroid.presentation.discovery
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.samsungremotetvandroid.core.diagnostics.DiagnosticsCategory
+import com.example.samsungremotetvandroid.core.diagnostics.DiagnosticsTracker
 import com.example.samsungremotetvandroid.domain.model.ConnectionState
 import com.example.samsungremotetvandroid.domain.usecase.ConnectToTvUseCase
 import com.example.samsungremotetvandroid.domain.usecase.ObserveConnectionStateUseCase
@@ -24,7 +26,8 @@ class DiscoveryViewModel @Inject constructor(
     private val observeConnectionStateUseCase: ObserveConnectionStateUseCase,
     private val scanDiscoveryUseCase: ScanDiscoveryUseCase,
     private val scanManualIpUseCase: ScanManualIpUseCase,
-    private val connectToTvUseCase: ConnectToTvUseCase
+    private val connectToTvUseCase: ConnectToTvUseCase,
+    private val diagnosticsTracker: DiagnosticsTracker
 ) : ViewModel() {
     val savedTvs = observeSavedTvsUseCase()
     val discoveredTvs = observeDiscoveredTvsUseCase()
@@ -44,6 +47,11 @@ class DiscoveryViewModel @Inject constructor(
             return
         }
 
+        diagnosticsTracker.log(
+            category = DiagnosticsCategory.LIFECYCLE,
+            message = "discovery refresh requested"
+        )
+
         viewModelScope.launch {
             uiStateFlow.update { current ->
                 current.copy(isScanning = true)
@@ -51,6 +59,11 @@ class DiscoveryViewModel @Inject constructor(
 
             runCatching {
                 scanDiscoveryUseCase()
+            }.onFailure { error ->
+                diagnosticsTracker.recordError(
+                    context = "discovery_refresh",
+                    errorMessage = error.message ?: "discovery refresh failed"
+                )
             }
 
             uiStateFlow.update { current ->
@@ -59,6 +72,12 @@ class DiscoveryViewModel @Inject constructor(
                     hasScanned = true
                 )
             }
+
+            diagnosticsTracker.log(
+                category = DiagnosticsCategory.LIFECYCLE,
+                message = "discovery refresh completed",
+                metadata = mapOf("discoveredCount" to discoveredTvs.value.size.toString())
+            )
         }
     }
 
@@ -90,11 +109,20 @@ class DiscoveryViewModel @Inject constructor(
         val trimmed = uiStateFlow.value.manualIpAddress.trim()
 
         if (trimmed.isEmpty()) {
+            diagnosticsTracker.recordError(
+                context = "manual_ip_validation",
+                errorMessage = "manual ip is required"
+            )
             showMessage("Please enter an IP address.")
             return
         }
 
         if (!isValidIpv4Address(trimmed)) {
+            diagnosticsTracker.recordError(
+                context = "manual_ip_validation",
+                errorMessage = "manual ip is invalid",
+                metadata = mapOf("ipAddress" to trimmed)
+            )
             showMessage("Please enter a valid IPv4 address.")
             return
         }
@@ -103,6 +131,12 @@ class DiscoveryViewModel @Inject constructor(
             val discoveredTv = runCatching {
                 scanManualIpUseCase(trimmed)
             }.getOrElse { error ->
+                diagnosticsTracker.recordError(
+                    context = "manual_ip_scan",
+                    errorMessage = error.message
+                        ?: "could not reach compatible samsung tv at provided ip",
+                    metadata = mapOf("ipAddress" to trimmed)
+                )
                 showMessage(error.message ?: "Could not reach a compatible Samsung TV at that IP.")
                 return@launch
             }
@@ -125,11 +159,44 @@ class DiscoveryViewModel @Inject constructor(
     }
 
     private suspend fun connectToTv(tvId: String, onConnected: () -> Unit) {
-        connectToTvUseCase(tvId)
+        diagnosticsTracker.log(
+            category = DiagnosticsCategory.RECONNECT,
+            message = "discovery connect requested",
+            metadata = mapOf("tvId" to tvId)
+        )
+        val connectResult = runCatching {
+            connectToTvUseCase(tvId)
+        }
+        val connectError = connectResult.exceptionOrNull()
+        if (connectError != null) {
+            diagnosticsTracker.recordError(
+                context = "discovery_connect",
+                errorMessage = connectError.message ?: "failed to connect selected tv",
+                metadata = mapOf("tvId" to tvId)
+            )
+            showMessage(connectError.message ?: "Unable to connect to this TV right now.")
+            return
+        }
 
         when (val state = connectionState.value) {
-            is ConnectionState.Ready -> onConnected()
-            is ConnectionState.Error -> showMessage(state.message)
+            is ConnectionState.Ready -> {
+                diagnosticsTracker.log(
+                    category = DiagnosticsCategory.LIFECYCLE,
+                    message = "discovery connect ready",
+                    metadata = mapOf("tvId" to tvId)
+                )
+                onConnected()
+            }
+
+            is ConnectionState.Error -> {
+                diagnosticsTracker.recordError(
+                    context = "discovery_connect",
+                    errorMessage = state.message,
+                    metadata = mapOf("tvId" to tvId)
+                )
+                showMessage(state.message)
+            }
+
             else -> Unit
         }
     }

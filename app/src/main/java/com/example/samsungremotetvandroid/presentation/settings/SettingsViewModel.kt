@@ -4,6 +4,8 @@ import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.samsungremotetvandroid.R
+import com.example.samsungremotetvandroid.core.diagnostics.DiagnosticsCategory
+import com.example.samsungremotetvandroid.core.diagnostics.DiagnosticsTracker
 import com.example.samsungremotetvandroid.domain.usecase.ForgetPairingUseCase
 import com.example.samsungremotetvandroid.domain.usecase.ObserveSavedTvsUseCase
 import com.example.samsungremotetvandroid.domain.usecase.RemoveDeviceUseCase
@@ -22,7 +24,8 @@ class SettingsViewModel @Inject constructor(
     @ApplicationContext private val appContext: Context,
     private val observeSavedTvsUseCase: ObserveSavedTvsUseCase,
     private val forgetPairingUseCase: ForgetPairingUseCase,
-    private val removeDeviceUseCase: RemoveDeviceUseCase
+    private val removeDeviceUseCase: RemoveDeviceUseCase,
+    private val diagnosticsTracker: DiagnosticsTracker
 ) : ViewModel() {
     val savedTvs = observeSavedTvsUseCase()
     private val uiStateFlow = MutableStateFlow(SettingsUiState())
@@ -50,6 +53,11 @@ class SettingsViewModel @Inject constructor(
             runCatching {
                 forgetPairingUseCase(tvId)
             }.onSuccess {
+                diagnosticsTracker.log(
+                    category = DiagnosticsCategory.PAIRING,
+                    message = "forget pairing completed",
+                    metadata = mapOf("tvId" to tvId)
+                )
                 uiStateFlow.update { current ->
                     current.copy(
                         pairingClearedTvIds = current.pairingClearedTvIds + tvId,
@@ -58,6 +66,11 @@ class SettingsViewModel @Inject constructor(
                     )
                 }
             }.onFailure { error ->
+                diagnosticsTracker.recordError(
+                    context = "settings_forget_pairing",
+                    errorMessage = error.message ?: appContext.getString(R.string.settings_action_failed),
+                    metadata = mapOf("tvId" to tvId)
+                )
                 uiStateFlow.update { current ->
                     current.copy(
                         alertTitle = appContext.getString(R.string.common_error),
@@ -77,6 +90,11 @@ class SettingsViewModel @Inject constructor(
             runCatching {
                 removeDeviceUseCase(tvId)
             }.onSuccess {
+                diagnosticsTracker.log(
+                    category = DiagnosticsCategory.LIFECYCLE,
+                    message = "remove device completed",
+                    metadata = mapOf("tvId" to tvId)
+                )
                 uiStateFlow.update { current ->
                     current.copy(
                         pairingClearedTvIds = current.pairingClearedTvIds - tvId,
@@ -85,6 +103,11 @@ class SettingsViewModel @Inject constructor(
                     )
                 }
             }.onFailure { error ->
+                diagnosticsTracker.recordError(
+                    context = "settings_remove_device",
+                    errorMessage = error.message ?: appContext.getString(R.string.settings_action_failed),
+                    metadata = mapOf("tvId" to tvId)
+                )
                 uiStateFlow.update { current ->
                     current.copy(
                         alertTitle = appContext.getString(R.string.common_error),
