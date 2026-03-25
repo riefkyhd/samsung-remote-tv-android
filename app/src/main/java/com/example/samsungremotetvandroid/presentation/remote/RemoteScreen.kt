@@ -1,6 +1,7 @@
 package com.example.samsungremotetvandroid.presentation.remote
 
 import android.content.pm.ApplicationInfo
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -13,9 +14,13 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
@@ -39,7 +44,17 @@ fun RemoteScreen(
     val lastErrorSummary by viewModel.lastErrorSummary.collectAsStateWithLifecycle()
     val pendingPin by viewModel.pendingPin.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    val hapticFeedback = LocalHapticFeedback.current
     val isDebuggable = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+    val emitControlHaptic = {
+        hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
+    }
+
+    DisposableEffect(viewModel) {
+        onDispose {
+            viewModel.releaseAllHeldKeys()
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -133,35 +148,62 @@ fun RemoteScreen(
             style = MaterialTheme.typography.titleMedium
         )
 
-        SecondaryActionButton(
+        HoldRepeatSecondaryActionButton(
             text = "Up",
-            onClick = { viewModel.sendRemoteKey(RemoteKey.D_PAD_UP) }
+            onPressStart = {
+                emitControlHaptic()
+                viewModel.startKeyHold(RemoteKey.D_PAD_UP)
+            },
+            onPressEnd = {
+                viewModel.stopKeyHold(RemoteKey.D_PAD_UP)
+            }
         )
 
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(SamsungSpacing.SpacingSm)
         ) {
-            SecondaryActionButton(
+            HoldRepeatSecondaryActionButton(
                 text = "Left",
-                onClick = { viewModel.sendRemoteKey(RemoteKey.D_PAD_LEFT) },
+                onPressStart = {
+                    emitControlHaptic()
+                    viewModel.startKeyHold(RemoteKey.D_PAD_LEFT)
+                },
+                onPressEnd = {
+                    viewModel.stopKeyHold(RemoteKey.D_PAD_LEFT)
+                },
                 modifier = Modifier.weight(1f)
             )
             SecondaryActionButton(
                 text = "OK",
-                onClick = { viewModel.sendRemoteKey(RemoteKey.OK) },
+                onClick = {
+                    emitControlHaptic()
+                    viewModel.sendRemoteKey(RemoteKey.OK)
+                },
                 modifier = Modifier.weight(1f)
             )
-            SecondaryActionButton(
+            HoldRepeatSecondaryActionButton(
                 text = "Right",
-                onClick = { viewModel.sendRemoteKey(RemoteKey.D_PAD_RIGHT) },
+                onPressStart = {
+                    emitControlHaptic()
+                    viewModel.startKeyHold(RemoteKey.D_PAD_RIGHT)
+                },
+                onPressEnd = {
+                    viewModel.stopKeyHold(RemoteKey.D_PAD_RIGHT)
+                },
                 modifier = Modifier.weight(1f)
             )
         }
 
-        SecondaryActionButton(
+        HoldRepeatSecondaryActionButton(
             text = "Down",
-            onClick = { viewModel.sendRemoteKey(RemoteKey.D_PAD_DOWN) }
+            onPressStart = {
+                emitControlHaptic()
+                viewModel.startKeyHold(RemoteKey.D_PAD_DOWN)
+            },
+            onPressEnd = {
+                viewModel.stopKeyHold(RemoteKey.D_PAD_DOWN)
+            }
         )
 
         Text(
@@ -173,14 +215,26 @@ fun RemoteScreen(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(SamsungSpacing.SpacingSm)
         ) {
-            SecondaryActionButton(
+            HoldRepeatSecondaryActionButton(
                 text = "Volume +",
-                onClick = { viewModel.sendRemoteKey(RemoteKey.VOLUME_UP) },
+                onPressStart = {
+                    emitControlHaptic()
+                    viewModel.startKeyHold(RemoteKey.VOLUME_UP)
+                },
+                onPressEnd = {
+                    viewModel.stopKeyHold(RemoteKey.VOLUME_UP)
+                },
                 modifier = Modifier.weight(1f)
             )
-            SecondaryActionButton(
+            HoldRepeatSecondaryActionButton(
                 text = "Volume -",
-                onClick = { viewModel.sendRemoteKey(RemoteKey.VOLUME_DOWN) },
+                onPressStart = {
+                    emitControlHaptic()
+                    viewModel.startKeyHold(RemoteKey.VOLUME_DOWN)
+                },
+                onPressEnd = {
+                    viewModel.stopKeyHold(RemoteKey.VOLUME_DOWN)
+                },
                 modifier = Modifier.weight(1f)
             )
         }
@@ -191,12 +245,18 @@ fun RemoteScreen(
         ) {
             SecondaryActionButton(
                 text = "Play/Pause",
-                onClick = { viewModel.sendRemoteKey(RemoteKey.MEDIA_PLAY_PAUSE) },
+                onClick = {
+                    emitControlHaptic()
+                    viewModel.sendRemoteKey(RemoteKey.MEDIA_PLAY_PAUSE)
+                },
                 modifier = Modifier.weight(1f)
             )
             SecondaryActionButton(
                 text = "Power",
-                onClick = { viewModel.sendRemoteKey(RemoteKey.POWER) },
+                onClick = {
+                    emitControlHaptic()
+                    viewModel.sendRemoteKey(RemoteKey.POWER)
+                },
                 modifier = Modifier.weight(1f)
             )
         }
@@ -252,6 +312,31 @@ fun RemoteScreen(
             }
         }
     }
+}
+
+@Composable
+private fun HoldRepeatSecondaryActionButton(
+    text: String,
+    onPressStart: () -> Unit,
+    onPressEnd: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    SecondaryActionButton(
+        text = text,
+        onClick = {},
+        modifier = modifier.pointerInput(onPressStart, onPressEnd) {
+            detectTapGestures(
+                onPress = {
+                    onPressStart()
+                    try {
+                        tryAwaitRelease()
+                    } finally {
+                        onPressEnd()
+                    }
+                }
+            )
+        }
+    )
 }
 
 private fun connectionStateLabel(state: ConnectionState): String {

@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -39,6 +40,13 @@ class RemoteViewModel @Inject constructor(
     val savedTvs = observeSavedTvsUseCase()
     private val connectAttemptsFlow = MutableStateFlow(0)
     private val pendingPinFlow = MutableStateFlow("")
+    private val holdRepeater = HoldRepeatController(
+        scope = viewModelScope,
+        initialDelayMs = HOLD_REPEAT_INITIAL_DELAY_MS,
+        repeatIntervalMs = HOLD_REPEAT_INTERVAL_MS,
+        onSend = { key -> sendRemoteKeyInternal(key) },
+        shouldContinue = { state -> state is ConnectionState.Ready }
+    )
 
     val diagnosticsEvents = diagnosticsTracker.recentEvents
     val lastErrorSummary = diagnosticsTracker.lastErrorSummary
@@ -55,7 +63,18 @@ class RemoteViewModel @Inject constructor(
         initialValue = "State: Disconnected | Saved TVs: 0 | Attempts: 0"
     )
 
+    init {
+        viewModelScope.launch {
+            connectionState.collectLatest { state ->
+                if (state !is ConnectionState.Ready) {
+                    holdRepeater.stopAll()
+                }
+            }
+        }
+    }
+
     fun connectFirstSavedTv() {
+        holdRepeater.stopAll()
         val tvId = savedTvs.value.firstOrNull()?.id ?: run {
             diagnosticsTracker.recordError(
                 context = "remote_connect",
@@ -83,6 +102,7 @@ class RemoteViewModel @Inject constructor(
     }
 
     fun disconnect() {
+        holdRepeater.stopAll()
         diagnosticsTracker.log(
             category = DiagnosticsCategory.LIFECYCLE,
             message = "remote disconnect requested"
@@ -101,16 +121,27 @@ class RemoteViewModel @Inject constructor(
 
     fun sendRemoteKey(key: RemoteKey) {
         viewModelScope.launch {
-            runCatching {
-                sendRemoteKeyUseCase(key)
-            }.onFailure { error ->
-                diagnosticsTracker.recordError(
-                    context = "remote_send_key",
-                    errorMessage = error.message ?: "failed to send remote key",
-                    metadata = mapOf("key" to key.name)
-                )
-            }
+            sendRemoteKeyInternal(key)
         }
+    }
+
+    fun startKeyHold(key: RemoteKey) {
+        if (key !in HOLD_REPEAT_KEYS) {
+            sendRemoteKey(key)
+            return
+        }
+        holdRepeater.start(
+            key = key,
+            connectionState = connectionState
+        )
+    }
+
+    fun stopKeyHold(key: RemoteKey) {
+        holdRepeater.stop(key)
+    }
+
+    fun releaseAllHeldKeys() {
+        holdRepeater.stopAll()
     }
 
     fun updatePendingPin(value: String) {
@@ -160,6 +191,23 @@ class RemoteViewModel @Inject constructor(
         }
     }
 
+    override fun onCleared() {
+        holdRepeater.stopAll()
+        super.onCleared()
+    }
+
+    private suspend fun sendRemoteKeyInternal(key: RemoteKey) {
+        runCatching {
+            sendRemoteKeyUseCase(key)
+        }.onFailure { error ->
+            diagnosticsTracker.recordError(
+                context = "remote_send_key",
+                errorMessage = error.message ?: "failed to send remote key",
+                metadata = mapOf("key" to key.name)
+            )
+        }
+    }
+
     private fun connectionStateLabel(state: ConnectionState): String {
         return when (state) {
             ConnectionState.Disconnected -> "Disconnected"
@@ -170,5 +218,18 @@ class RemoteViewModel @Inject constructor(
             is ConnectionState.Ready -> "Ready"
             is ConnectionState.Error -> "Error"
         }
+    }
+
+    private companion object {
+        private const val HOLD_REPEAT_INITIAL_DELAY_MS = 300L
+        private const val HOLD_REPEAT_INTERVAL_MS = 90L
+        private val HOLD_REPEAT_KEYS = setOf(
+            RemoteKey.D_PAD_UP,
+            RemoteKey.D_PAD_DOWN,
+            RemoteKey.D_PAD_LEFT,
+            RemoteKey.D_PAD_RIGHT,
+            RemoteKey.VOLUME_UP,
+            RemoteKey.VOLUME_DOWN
+        )
     }
 }
