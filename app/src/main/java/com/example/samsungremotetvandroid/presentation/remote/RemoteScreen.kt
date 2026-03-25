@@ -9,10 +9,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
@@ -43,6 +45,7 @@ fun RemoteScreen(
     val diagnosticsEvents by viewModel.diagnosticsEvents.collectAsStateWithLifecycle()
     val lastErrorSummary by viewModel.lastErrorSummary.collectAsStateWithLifecycle()
     val pendingPin by viewModel.pendingPin.collectAsStateWithLifecycle()
+    val userMessage by viewModel.userMessage.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val hapticFeedback = LocalHapticFeedback.current
     val isDebuggable = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
@@ -252,7 +255,7 @@ fun RemoteScreen(
                 modifier = Modifier.weight(1f)
             )
             SecondaryActionButton(
-                text = "Power",
+                text = stringResource(id = R.string.remote_power_best_effort_label),
                 onClick = {
                     emitControlHaptic()
                     viewModel.sendRemoteKey(RemoteKey.POWER)
@@ -262,10 +265,30 @@ fun RemoteScreen(
         }
 
         Text(
-            text = "Quick Launch remains curated shortcuts, not installed-app enumeration.",
+            text = stringResource(id = R.string.remote_power_best_effort_note),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        Text(
+            text = stringResource(id = R.string.remote_quick_launch_note),
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Start
+        )
+
+        SecondaryActionButton(
+            text = stringResource(id = R.string.remote_quick_launch_unavailable_label),
+            onClick = {
+                emitControlHaptic()
+                viewModel.showQuickLaunchUnavailable()
+            }
+        )
+
+        Text(
+            text = stringResource(id = R.string.remote_installed_app_unsupported_note),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
         )
 
         if (isDebuggable) {
@@ -311,6 +334,23 @@ fun RemoteScreen(
                 }
             }
         }
+    }
+
+    userMessage?.let { message ->
+        AlertDialog(
+            onDismissRequest = viewModel::dismissUserMessage,
+            title = {
+                Text(text = stringResource(id = R.string.common_error))
+            },
+            text = {
+                Text(text = message)
+            },
+            confirmButton = {
+                TextButton(onClick = viewModel::dismissUserMessage) {
+                    Text(text = stringResource(id = R.string.common_ok))
+                }
+            }
+        )
     }
 }
 

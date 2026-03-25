@@ -6,6 +6,8 @@ import com.example.samsungremotetvandroid.core.diagnostics.DiagnosticsCategory
 import com.example.samsungremotetvandroid.core.diagnostics.DiagnosticsTracker
 import com.example.samsungremotetvandroid.domain.model.ConnectionState
 import com.example.samsungremotetvandroid.domain.model.RemoteKey
+import com.example.samsungremotetvandroid.domain.model.TvCapability
+import com.example.samsungremotetvandroid.domain.usecase.ObserveDiscoveredTvsUseCase
 import com.example.samsungremotetvandroid.domain.usecase.CancelEncryptedPairingUseCase
 import com.example.samsungremotetvandroid.domain.usecase.CompleteEncryptedPairingUseCase
 import com.example.samsungremotetvandroid.domain.usecase.ConnectToTvUseCase
@@ -29,6 +31,7 @@ import kotlinx.coroutines.launch
 class RemoteViewModel @Inject constructor(
     private val observeConnectionStateUseCase: ObserveConnectionStateUseCase,
     private val observeSavedTvsUseCase: ObserveSavedTvsUseCase,
+    private val observeDiscoveredTvsUseCase: ObserveDiscoveredTvsUseCase,
     private val connectToTvUseCase: ConnectToTvUseCase,
     private val completeEncryptedPairingUseCase: CompleteEncryptedPairingUseCase,
     private val cancelEncryptedPairingUseCase: CancelEncryptedPairingUseCase,
@@ -38,8 +41,10 @@ class RemoteViewModel @Inject constructor(
 ) : ViewModel() {
     val connectionState = observeConnectionStateUseCase()
     val savedTvs = observeSavedTvsUseCase()
+    val discoveredTvs = observeDiscoveredTvsUseCase()
     private val connectAttemptsFlow = MutableStateFlow(0)
     private val pendingPinFlow = MutableStateFlow("")
+    private val userMessageFlow = MutableStateFlow<String?>(null)
     private val holdRepeater = HoldRepeatController(
         scope = viewModelScope,
         initialDelayMs = HOLD_REPEAT_INITIAL_DELAY_MS,
@@ -51,6 +56,7 @@ class RemoteViewModel @Inject constructor(
     val diagnosticsEvents = diagnosticsTracker.recentEvents
     val lastErrorSummary = diagnosticsTracker.lastErrorSummary
     val pendingPin: StateFlow<String> = pendingPinFlow.asStateFlow()
+    val userMessage: StateFlow<String?> = userMessageFlow.asStateFlow()
     val diagnosticsSummary = combine(
         connectionState,
         savedTvs,
@@ -130,6 +136,10 @@ class RemoteViewModel @Inject constructor(
             sendRemoteKey(key)
             return
         }
+        if (!isRemoteKeySupported(key)) {
+            holdRepeater.stop(key)
+            return
+        }
         holdRepeater.start(
             key = key,
             connectionState = connectionState
@@ -142,6 +152,19 @@ class RemoteViewModel @Inject constructor(
 
     fun releaseAllHeldKeys() {
         holdRepeater.stopAll()
+    }
+
+    fun dismissUserMessage() {
+        userMessageFlow.value = null
+    }
+
+    fun showQuickLaunchUnavailable() {
+        showUserMessage(QUICK_LAUNCH_UNAVAILABLE_MESSAGE)
+        diagnosticsTracker.log(
+            category = DiagnosticsCategory.CAPABILITIES,
+            message = "quick launch blocked truthfully",
+            metadata = mapOf("reason" to "transport_unavailable_baseline")
+        )
     }
 
     fun updatePendingPin(value: String) {
@@ -197,6 +220,9 @@ class RemoteViewModel @Inject constructor(
     }
 
     private suspend fun sendRemoteKeyInternal(key: RemoteKey) {
+        if (!isRemoteKeySupported(key)) {
+            return
+        }
         runCatching {
             sendRemoteKeyUseCase(key)
         }.onFailure { error ->
@@ -206,6 +232,36 @@ class RemoteViewModel @Inject constructor(
                 metadata = mapOf("key" to key.name)
             )
         }
+    }
+
+    private fun isRemoteKeySupported(key: RemoteKey): Boolean {
+        val requiredCapability = capabilityForKey(key) ?: return true
+        val tvCapabilities = activeTvCapabilities() ?: return true
+        if (requiredCapability in tvCapabilities) {
+            return true
+        }
+
+        val message = unsupportedMessageForCapability(requiredCapability)
+        showUserMessage(message)
+        diagnosticsTracker.recordError(
+            context = "remote_capability_blocked",
+            errorMessage = message,
+            metadata = mapOf(
+                "key" to key.name,
+                "capability" to requiredCapability.name
+            )
+        )
+        return false
+    }
+
+    private fun activeTvCapabilities(): Set<TvCapability>? {
+        val tvId = activeTvId(connectionState.value) ?: return null
+        return savedTvs.value.firstOrNull { it.id == tvId }?.capabilities
+            ?: discoveredTvs.value.firstOrNull { it.id == tvId }?.capabilities
+    }
+
+    private fun showUserMessage(message: String) {
+        userMessageFlow.value = message
     }
 
     private fun connectionStateLabel(state: ConnectionState): String {

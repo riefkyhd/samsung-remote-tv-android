@@ -44,4 +44,9 @@
     <string name="remote_pin_label">TV PIN</string>
     <string name="remote_pin_submit">Submit PIN</string>
     <string name="remote_pin_cancel">Cancel Pairing</string>
+    <string name="remote_power_best_effort_label">Power (Best-effort)</string>
+    <string name="remote_power_best_effort_note">Power/Wake is best-effort and may vary by TV generation/state.</string>
+    <string name="remote_quick_launch_note">Quick Launch remains curated shortcuts, not installed-app enumeration.</string>
+    <string name="remote_quick_launch_unavailable_label">Quick Launch (Unavailable)</string>
+    <string name="remote_installed_app_unsupported_note">Installed-app browsing/enumeration is unsupported in this Android baseline.</string>
 </resources>
