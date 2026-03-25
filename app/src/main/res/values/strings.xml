@@ -23,4 +23,16 @@
     <string name="common_cancel">Cancel</string>
     <string name="common_error">Error</string>
     <string name="common_ok">OK</string>
+    <string name="settings_intro">Forget Pairing clears saved pairing data. Remove Device also deletes the saved TV entry.</string>
+    <string name="settings_saved_count">Saved TVs: %1$d</string>
+    <string name="settings_no_saved_tvs">No saved TVs available.</string>
+    <string name="settings_saved_tv_help">Forget Pairing clears token/pairing state. Remove Device clears pairing state and removes this TV.</string>
+    <string name="settings_forget_pairing">Forget Pairing</string>
+    <string name="settings_pairing_cleared">Pairing Cleared</string>
+    <string name="settings_remove_device">Remove Device</string>
+    <string name="settings_pairing_reset_title">Pairing Reset</string>
+    <string name="settings_pairing_reset_success">Pairing data cleared. The next connection will require a new authorization.</string>
+    <string name="settings_device_removed_title">Device Removed</string>
+    <string name="settings_device_removed_success">Saved TV and pairing data were removed.</string>
+    <string name="settings_action_failed">Action failed. Please try again.</string>
 </resources>

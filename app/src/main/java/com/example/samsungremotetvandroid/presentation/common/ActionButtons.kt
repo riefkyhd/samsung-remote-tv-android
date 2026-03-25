@@ -13,10 +13,12 @@ import com.example.samsungremotetvandroid.core.design.SamsungTheme
 fun PrimaryActionButton(
     text: String,
     onClick: () -> Unit,
+    enabled: Boolean = true,
     modifier: Modifier = Modifier
 ) {
     Button(
         onClick = onClick,
+        enabled = enabled,
         modifier = modifier.fillMaxWidth()
     ) {
         Text(text = text)
@@ -27,10 +29,12 @@ fun PrimaryActionButton(
 fun SecondaryActionButton(
     text: String,
     onClick: () -> Unit,
+    enabled: Boolean = true,
     modifier: Modifier = Modifier
 ) {
     OutlinedButton(
         onClick = onClick,
+        enabled = enabled,
         modifier = modifier.fillMaxWidth()
     ) {
         Text(text = text)
@@ -41,10 +45,12 @@ fun SecondaryActionButton(
 fun DestructiveActionButton(
     text: String,
     onClick: () -> Unit,
+    enabled: Boolean = true,
     modifier: Modifier = Modifier
 ) {
     Button(
         onClick = onClick,
+        enabled = enabled,
         modifier = modifier.fillMaxWidth(),
         colors = ButtonDefaults.buttonColors(
             containerColor = SamsungTheme.semanticColors.destructive
