@@ -32,6 +32,24 @@ If Android intentionally diverges visually or behaviorally, document the reason 
 
 ---
 
+## Screenshot Reference Source
+
+Use the iOS screenshots in `evidence/` as the primary visual reference for Android UI parity work.
+
+These screenshots should be used to compare:
+- Discovery
+- Remote
+- Settings
+- dialogs/sheets
+- 
+- pairing states
+- success/error states
+- spacing, grouping, and control prominence
+
+If the screenshot reference and current Android UI differ, prefer preserving the iOS product meaning while adapting carefully for Android.
+
+---
+
 ## Core Screens to Mirror
 
 ### 1. Discovery

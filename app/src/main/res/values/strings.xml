@@ -57,6 +57,7 @@
     <string name="remote_connection_state_title">Connection State</string>
     <string name="remote_connection_truthfulness_note">Connected is distinct from Ready to keep state truthful.</string>
     <string name="remote_controls_ready_hint">Remote controls are ready.</string>
+    <string name="remote_controls_probe_hint">Connection restored. Send one command to confirm control before hold/repeat.</string>
     <string name="remote_controls_locked_hint">Remote controls stay locked until the selected TV reaches Ready.</string>
     <string name="remote_connect_button">Connect</string>
     <string name="remote_disconnect_button">Disconnect</string>

@@ -7,11 +7,9 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
@@ -76,7 +74,7 @@ fun DiscoveryScreen(
                 brush = Brush.verticalGradient(
                     colors = listOf(
                         MaterialTheme.colorScheme.surface,
-                        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.38f)
+                        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.28f)
                     )
                 )
             )
@@ -134,11 +132,18 @@ fun DiscoveryScreen(
             }
 
             item {
-                Text(
-                    text = stringResourceSafe(R.string.app_name),
-                    style = MaterialTheme.typography.headlineLarge,
-                    fontWeight = FontWeight.SemiBold
-                )
+                Column(verticalArrangement = Arrangement.spacedBy(SamsungSpacing.SpacingXs)) {
+                    Text(
+                        text = stringResourceSafe(R.string.app_name),
+                        style = MaterialTheme.typography.headlineLarge,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        text = stringResourceSafe(R.string.discovery_intro),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
 
             if (uiState.isConnecting) {
@@ -154,7 +159,8 @@ fun DiscoveryScreen(
             item {
                 Text(
                     text = stringResourceSafe(R.string.discovery_saved_section),
-                    style = MaterialTheme.typography.titleMedium
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
 
@@ -173,7 +179,8 @@ fun DiscoveryScreen(
             item {
                 Text(
                     text = stringResourceSafe(R.string.discovery_discovered_section),
-                    style = MaterialTheme.typography.titleMedium
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
 
@@ -193,13 +200,6 @@ fun DiscoveryScreen(
                 )
             }
 
-            item {
-                Text(
-                    text = stringResourceSafe(R.string.discovery_intro),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
         }
     }
 
@@ -304,7 +304,7 @@ private fun DeviceListCard(
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.64f)
+            containerColor = MaterialTheme.colorScheme.surfaceVariant
         )
     ) {
         if (tvs.isEmpty()) {
@@ -371,7 +371,7 @@ private fun DeviceRow(
             )
             Text(
                 text = "${tv.modelName} • ${tv.ipAddress}",
-                style = MaterialTheme.typography.bodySmall,
+                style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis

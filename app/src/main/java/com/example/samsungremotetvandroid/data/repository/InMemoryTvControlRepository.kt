@@ -11,6 +11,10 @@ import com.example.samsungremotetvandroid.core.diagnostics.DiagnosticsCategory
 import com.example.samsungremotetvandroid.core.diagnostics.DiagnosticsTracker
 import com.example.samsungremotetvandroid.data.legacy.LegacyTcpRemoteClient
 import com.example.samsungremotetvandroid.data.legacy.LegacyEncryptedSessionCoordinator
+import com.example.samsungremotetvandroid.data.legacy.SpcHandshakeClient
+import com.example.samsungremotetvandroid.data.legacy.SpcWebSocketClient
+import com.example.samsungremotetvandroid.data.storage.SpcCredentials
+import com.example.samsungremotetvandroid.data.storage.SpcVariants
 import com.example.samsungremotetvandroid.data.storage.SensitivePairingStorage
 import com.example.samsungremotetvandroid.domain.model.ConnectionState
 import com.example.samsungremotetvandroid.domain.model.QuickLaunchShortcut
@@ -37,6 +41,7 @@ import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -54,7 +59,6 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import okhttp3.OkHttpClient
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
@@ -85,6 +89,12 @@ class InMemoryTvControlRepository @Inject constructor(
         .writeTimeout(450, TimeUnit.MILLISECONDS)
         .build()
 
+    private val restSpcClient = restClient.newBuilder()
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.SECONDS)
+        .writeTimeout(5, TimeUnit.SECONDS)
+        .build()
+
     private val nsdManager by lazy {
         context.getSystemService(Context.NSD_SERVICE) as NsdManager
     }
@@ -93,6 +103,11 @@ class InMemoryTvControlRepository @Inject constructor(
     private val discoveryMutex = Mutex()
     private val legacyCoordinator = LegacyEncryptedSessionCoordinator()
     private val legacyTcpClient = LegacyTcpRemoteClient()
+    private val spcHandshakeClient = SpcHandshakeClient(restSpcClient)
+    private val spcWebSocketClient = SpcWebSocketClient(
+        httpClient = restSpcClient,
+        wsClient = wsClient
+    )
 
     private val savedTvsState = MutableStateFlow<List<SamsungTv>>(emptyList())
 
@@ -108,6 +123,9 @@ class InMemoryTvControlRepository @Inject constructor(
     private var activeLegacyPairing = false
     private var activeModernCommandMode: ModernCommandMode = ModernCommandMode.REMOTE_CONTROL
     private var activeModernSessionId: String? = null
+    private var modernSessionRefreshAttempted: Boolean = false
+    private var activeSpcCredentials: SpcCredentials? = null
+    private var activeSpcIdentifier: String? = null
 
     @Volatile
     private var readyForCommands: Boolean = false
@@ -249,7 +267,14 @@ class InMemoryTvControlRepository @Inject constructor(
 
         val savedTv = savedTvsState.value.firstOrNull { it.id == tvId }
         val discoveredTv = discoveredTvsState.value.firstOrNull { it.id == tvId }
-        val tv = savedTv ?: discoveredTv
+        val tv = when {
+            savedTv != null && discoveredTv != null -> discoveredTv.copy(
+                id = savedTv.id,
+                displayName = savedTv.displayName.takeIf { it.isNotBlank() } ?: discoveredTv.displayName
+            )
+            discoveredTv != null -> discoveredTv
+            else -> savedTv
+        }
 
         if (tv == null) {
             connectionStateFlow.value = ConnectionState.Error("Unable to connect: TV not found")
@@ -261,42 +286,72 @@ class InMemoryTvControlRepository @Inject constructor(
             return
         }
 
-        when (tv.protocol) {
-            TvProtocol.MODERN -> {
-                connectModern(
-                    tv = tv,
-                    shouldPersistAfterConnect = (savedTv == null)
+        var shouldPersistAfterConnect = if (savedTv == null) {
+            true
+        } else {
+            discoveredTv != null && (
+                savedTv.protocol != discoveredTv.protocol ||
+                    savedTv.modelName != discoveredTv.modelName ||
+                    savedTv.macAddress != discoveredTv.macAddress
                 )
-                if (connectionStateFlow.value is ConnectionState.Error && isLegacyModel(tv.modelName)) {
+        }
+
+        val effectiveProtocol = when (tv.protocol) {
+            TvProtocol.MODERN -> {
+                if (shouldPreferLegacyEncrypted(tv)) {
                     diagnosticsTracker.log(
                         category = DiagnosticsCategory.PROTOCOL,
-                        message = "modern connect failed on legacy-marked model; trying encrypted fallback",
+                        message = "connect routing modern->legacy_encrypted for legacy model/signature",
                         metadata = mapOf("tvId" to tv.id)
                     )
-                    connectLegacyEncrypted(
-                        tv = tv.copy(protocol = TvProtocol.LEGACY_ENCRYPTED),
-                        shouldPersistAfterConnect = (savedTv == null),
-                        skipModernProbe = true
-                    )
+                    TvProtocol.LEGACY_ENCRYPTED
+                } else {
+                    TvProtocol.MODERN
                 }
             }
+            else -> tv.protocol
+        }
+        val effectiveTv = if (tv.protocol != effectiveProtocol) {
+            tv.copy(protocol = effectiveProtocol)
+        } else {
+            tv
+        }
+        if (savedTv != null && savedTv.protocol != effectiveProtocol) {
+            shouldPersistAfterConnect = true
+        }
+
+        when (effectiveProtocol) {
+            TvProtocol.MODERN -> connectModern(
+                tv = effectiveTv,
+                shouldPersistAfterConnect = shouldPersistAfterConnect
+            )
 
             TvProtocol.LEGACY_ENCRYPTED -> connectLegacyEncrypted(
-                tv = tv,
-                shouldPersistAfterConnect = (savedTv == null),
-                skipModernProbe = false
+                tv = effectiveTv,
+                shouldPersistAfterConnect = shouldPersistAfterConnect
             )
 
             TvProtocol.LEGACY_REMOTE -> {
-                diagnosticsTracker.log(
-                    category = DiagnosticsCategory.PROTOCOL,
-                    message = "legacy remote protocol selected; attempting modern fallback first",
-                    metadata = mapOf("tvId" to tv.id)
-                )
-                connectModern(
-                    tv = tv,
-                    shouldPersistAfterConnect = (savedTv == null)
-                )
+                val encryptedFallbackCandidate = effectiveTv.copy(protocol = TvProtocol.LEGACY_ENCRYPTED)
+                if (shouldPreferLegacyEncrypted(encryptedFallbackCandidate)) {
+                    diagnosticsTracker.log(
+                        category = DiagnosticsCategory.PROTOCOL,
+                        message = "legacy remote protocol selected; routing to encrypted pairing path",
+                        metadata = mapOf("tvId" to tv.id)
+                    )
+                    connectLegacyEncrypted(
+                        tv = encryptedFallbackCandidate,
+                        shouldPersistAfterConnect = true
+                    )
+                } else {
+                    val message = "This TV appears to require the old legacy TCP remote protocol, which is unsupported in this Android baseline."
+                    connectionStateFlow.value = ConnectionState.Error(message)
+                    diagnosticsTracker.recordError(
+                        context = "connect_legacy_remote_unsupported",
+                        errorMessage = message,
+                        metadata = mapOf("tvId" to tv.id)
+                    )
+                }
             }
         }
     }
@@ -330,6 +385,7 @@ class InMemoryTvControlRepository @Inject constructor(
         }
 
         var tvToReconnect: SamsungTv? = null
+        var pairingIdentifier: String? = null
         connectionMutex.withLock {
             val tv = activeTv
             if (tv == null || tv.id != tvId || tv.protocol != TvProtocol.LEGACY_ENCRYPTED) {
@@ -352,23 +408,64 @@ class InMemoryTvControlRepository @Inject constructor(
                 connectionStateFlow.value = state
             }
             tvToReconnect = tv
+            pairingIdentifier = pairingIdentifierFor(tv)
 
             diagnosticsTracker.log(
                 category = DiagnosticsCategory.PAIRING,
-                message = "encrypted pairing accepted; attempting legacy command channel connect",
+                message = "encrypted pin submitted; running spc handshake",
                 metadata = mapOf("tvId" to tvId)
             )
         }
 
-        tvToReconnect?.let { tv ->
-            connectLegacyCommandChannel(
-                tv = tv,
-                shouldPersistAfterConnect = true
+        val tv = tvToReconnect ?: return
+        val identifier = pairingIdentifier ?: pairingIdentifierFor(tv)
+        val pairingOutcome = runCatching {
+            spcHandshakeClient.completePairing(
+                ipAddress = tv.ipAddress,
+                pin = sanitizedPin,
+                preferredVariants = sensitivePairingStorage.loadSpcVariants(identifier)
             )
+        }.getOrElse { error ->
+            val message = error.message
+                ?: "Could not complete encrypted pairing. Retry and re-enter the TV PIN."
+            connectionStateFlow.value = ConnectionState.Error(message)
+            diagnosticsTracker.recordError(
+                context = "complete_encrypted_pairing",
+                errorMessage = message,
+                metadata = mapOf("tvId" to tv.id)
+            )
+            return
         }
+
+        sensitivePairingStorage.saveSpcCredentials(
+            pairingOutcome.credentials,
+            identifier
+        )
+        sensitivePairingStorage.saveSpcVariants(
+            variants = SpcVariants(
+                step0 = pairingOutcome.step0Variant,
+                step1 = pairingOutcome.step1Variant
+            ),
+            identifier = identifier
+        )
+
+        diagnosticsTracker.log(
+            category = DiagnosticsCategory.PAIRING,
+            message = "spc credentials saved",
+            metadata = mapOf("tvId" to tv.id)
+        )
+
+        connectSpcCommandChannel(
+            tv = tv,
+            credentials = pairingOutcome.credentials,
+            shouldPersistAfterConnect = true,
+            awaitFirstCommand = true,
+            credentialSource = LegacyEncryptedSessionCoordinator.CredentialSource.FRESH_PAIRING
+        )
     }
 
     override suspend fun cancelEncryptedPairing(tvId: String) {
+        var ipToCancel: String? = null
         connectionMutex.withLock {
             val tv = activeTv
             if (tv == null || tv.id != tvId || tv.protocol != TvProtocol.LEGACY_ENCRYPTED) {
@@ -380,12 +477,19 @@ class InMemoryTvControlRepository @Inject constructor(
             awaitingLegacyFirstCommand = transition.awaitingFirstCommand
             activeLegacyCredentialsSource = transition.credentialSource
             connectionStateFlow.value = ConnectionState.Disconnected
+            ipToCancel = tv.ipAddress
 
             diagnosticsTracker.log(
                 category = DiagnosticsCategory.PAIRING,
                 message = "encrypted pairing cancelled",
                 metadata = mapOf("tvId" to tvId)
             )
+        }
+
+        ipToCancel?.let { ipAddress ->
+            runCatching {
+                spcHandshakeClient.cancelPairing(ipAddress)
+            }
         }
     }
 
@@ -510,6 +614,7 @@ class InMemoryTvControlRepository @Inject constructor(
             activeLegacyCredentialsSource = null
             activeModernCommandMode = ModernCommandMode.REMOTE_CONTROL
             activeModernSessionId = null
+            modernSessionRefreshAttempted = false
 
             val pairingIdentifier = pairingIdentifierFor(tv)
             var storedToken = sensitivePairingStorage.loadToken(pairingIdentifier)?.takeIf { it.isNotBlank() }
@@ -530,6 +635,7 @@ class InMemoryTvControlRepository @Inject constructor(
                 readyForCommands = false
                 activeModernCommandMode = ModernCommandMode.REMOTE_CONTROL
                 activeModernSessionId = null
+                modernSessionRefreshAttempted = false
 
                 val signal = CompletableDeferred<Unit>()
                 readySignal = signal
@@ -639,30 +745,44 @@ class InMemoryTvControlRepository @Inject constructor(
 
     private suspend fun connectLegacyEncrypted(
         tv: SamsungTv,
-        shouldPersistAfterConnect: Boolean,
-        skipModernProbe: Boolean
+        shouldPersistAfterConnect: Boolean
     ) {
-        if (!skipModernProbe) {
+        val pairingIdentifier = pairingIdentifierFor(tv)
+        val rawStoredCredentials = sensitivePairingStorage.loadSpcCredentials(pairingIdentifier)
+        val storedCredentials = rawStoredCredentials?.takeIf { isValidSpcCredentials(it) }
+        if (rawStoredCredentials != null && storedCredentials == null) {
+            sensitivePairingStorage.deleteSensitiveData(pairingIdentifier)
             diagnosticsTracker.log(
-                category = DiagnosticsCategory.PROTOCOL,
-                message = "legacy encrypted selected; trying modern command channel before PIN pairing",
+                category = DiagnosticsCategory.PAIRING,
+                message = "cleared invalid stored spc credentials",
+                metadata = mapOf("tvId" to tv.id)
+            )
+        }
+
+        if (storedCredentials != null) {
+            diagnosticsTracker.log(
+                category = DiagnosticsCategory.PAIRING,
+                message = "attempting encrypted connect with stored spc credentials",
                 metadata = mapOf("tvId" to tv.id)
             )
 
-            connectModern(
+            val connectedWithStoredCredentials = connectSpcCommandChannel(
                 tv = tv,
-                shouldPersistAfterConnect = shouldPersistAfterConnect
+                credentials = storedCredentials,
+                shouldPersistAfterConnect = shouldPersistAfterConnect,
+                awaitFirstCommand = true,
+                credentialSource = LegacyEncryptedSessionCoordinator.CredentialSource.STORED
             )
-            if (connectionStateFlow.value is ConnectionState.Ready ||
-                connectionStateFlow.value is ConnectionState.ConnectedNotReady
-            ) {
-                diagnosticsTracker.log(
-                    category = DiagnosticsCategory.PROTOCOL,
-                    message = "legacy encrypted tv connected via modern command channel",
-                    metadata = mapOf("tvId" to tv.id)
-                )
+            if (connectedWithStoredCredentials) {
                 return
             }
+
+            sensitivePairingStorage.deleteSensitiveData(pairingIdentifier)
+            diagnosticsTracker.log(
+                category = DiagnosticsCategory.PAIRING,
+                message = "stored spc credentials failed; cleared and falling back to fresh pairing",
+                metadata = mapOf("tvId" to tv.id)
+            )
         }
 
         connectionMutex.withLock {
@@ -670,6 +790,8 @@ class InMemoryTvControlRepository @Inject constructor(
             activeTransport = ActiveTransport.LEGACY_ENCRYPTED
             readyForCommands = false
             activeTv = tv
+            activeSpcCredentials = null
+            activeSpcIdentifier = null
 
             val transition = legacyCoordinator.onConnect(
                 tvId = tv.id,
@@ -683,77 +805,104 @@ class InMemoryTvControlRepository @Inject constructor(
             transition.emittedStates.forEach { state ->
                 connectionStateFlow.value = state
             }
+        }
 
-            val requiresPinPage = transition.emittedStates.any { it is ConnectionState.PinRequired }
-            if (requiresPinPage) {
-                val pinPageReady = prepareLegacyPinPage(tv.ipAddress)
-                if (!pinPageReady) {
-                    connectionStateFlow.value = ConnectionState.Error(
-                        "Could not open the PIN page on TV. Keep the TV awake and retry."
-                    )
-                    diagnosticsTracker.recordError(
-                        context = "legacy_prepare_pin_page",
-                        errorMessage = "legacy cloud pin page could not be started",
-                        metadata = mapOf("tvId" to tv.id)
-                    )
-                    return
-                }
-            }
+        val pairingPreparationError = runCatching {
+            spcHandshakeClient.startPairing(tv.ipAddress)
+        }.exceptionOrNull()
 
-            diagnosticsTracker.log(
-                category = DiagnosticsCategory.PAIRING,
-                message = "legacy encrypted connect entering fresh pairing",
+        if (pairingPreparationError != null) {
+            val message = pairingPreparationError.message
+                ?: "Could not open the PIN page on TV. Keep the TV awake and retry."
+            connectionStateFlow.value = ConnectionState.Error(
+                message
+            )
+            diagnosticsTracker.recordError(
+                context = "legacy_prepare_pin_page",
+                errorMessage = message,
                 metadata = mapOf("tvId" to tv.id)
             )
+            return
         }
+
+        diagnosticsTracker.log(
+            category = DiagnosticsCategory.PAIRING,
+            message = "legacy encrypted connect entering fresh pairing",
+            metadata = mapOf("tvId" to tv.id)
+        )
     }
 
-    private suspend fun connectLegacyCommandChannel(
+    private suspend fun connectSpcCommandChannel(
         tv: SamsungTv,
-        shouldPersistAfterConnect: Boolean
-    ) {
+        credentials: SpcCredentials,
+        shouldPersistAfterConnect: Boolean,
+        awaitFirstCommand: Boolean,
+        credentialSource: LegacyEncryptedSessionCoordinator.CredentialSource?
+    ): Boolean {
+        var connected = false
         connectionMutex.withLock {
             shutdownActiveSocket(setDisconnected = false)
             activeTransport = ActiveTransport.LEGACY_ENCRYPTED
             activeTv = tv
             readyForCommands = false
+            activeSpcCredentials = credentials
+            activeSpcIdentifier = pairingIdentifierFor(tv)
             connectionStateFlow.value = ConnectionState.Connecting
 
             val connectResult = runCatching {
-                withContext(Dispatchers.IO) {
-                    legacyTcpClient.connect(
-                        ipAddress = tv.ipAddress,
-                        remoteName = MODERN_CLIENT_NAME
-                    )
-                }
+                spcWebSocketClient.connect(tv.ipAddress)
             }
 
-            val connectedPort = connectResult.getOrElse { error ->
-                val message = error.message ?: "Could not open the legacy command channel after PIN."
+            connectResult.getOrElse { error ->
+                val message = error.message ?: "Could not open the encrypted command channel."
                 connectionStateFlow.value = ConnectionState.Error(message)
+                readyForCommands = false
+                activeSpcCredentials = null
+                activeSpcIdentifier = null
                 diagnosticsTracker.recordError(
-                    context = "connect_legacy_command_channel",
+                    context = "connect_spc_command_channel",
                     errorMessage = message,
                     metadata = mapOf("tvId" to tv.id)
                 )
                 return@withLock
             }
 
-            readyForCommands = true
-            connectionStateFlow.value = ConnectionState.Ready(tv.id)
-            diagnosticsTracker.log(
-                category = DiagnosticsCategory.LIFECYCLE,
-                message = "legacy command channel is ready",
-                metadata = mapOf(
-                    "tvId" to tv.id,
-                    "port" to connectedPort.toString()
+            if (awaitFirstCommand) {
+                readyForCommands = false
+                awaitingLegacyFirstCommand = true
+                activeLegacyCredentialsSource = credentialSource
+                activeLegacyPairing = false
+                connectionStateFlow.value = ConnectionState.ConnectedNotReady(tv.id)
+                diagnosticsTracker.log(
+                    category = DiagnosticsCategory.LIFECYCLE,
+                    message = "encrypted spc command channel connected; awaiting first command confirmation",
+                    metadata = mapOf(
+                        "tvId" to tv.id,
+                        "sessionId" to credentials.sessionId.toString()
+                    )
                 )
-            )
+            } else {
+                readyForCommands = true
+                awaitingLegacyFirstCommand = false
+                activeLegacyCredentialsSource = credentialSource
+                activeLegacyPairing = false
+                connectionStateFlow.value = ConnectionState.Ready(tv.id)
+                diagnosticsTracker.log(
+                    category = DiagnosticsCategory.LIFECYCLE,
+                    message = "encrypted spc command channel is ready",
+                    metadata = mapOf(
+                        "tvId" to tv.id,
+                        "sessionId" to credentials.sessionId.toString()
+                    )
+                )
+            }
 
             if (shouldPersistAfterConnect) {
                 persistToSavedTvs(tv)
             }
+            connected = true
         }
+        return connected
     }
 
     private suspend fun sendModernKey(key: RemoteKey) {
@@ -776,6 +925,15 @@ class InMemoryTvControlRepository @Inject constructor(
                 metadata = mapOf("key" to key.name)
             )
             return
+        }
+
+        if (requiresSession(activeModernCommandMode) && activeModernSessionId.isNullOrBlank()) {
+            diagnosticsTracker.log(
+                category = DiagnosticsCategory.PROTOCOL,
+                message = "session-required modern mode without session; downgrading to non-session mode",
+                metadata = mapOf("key" to key.name)
+            )
+            activeModernCommandMode = ModernCommandMode.EMIT_KEYPRESS
         }
 
         val payload = buildModernKeyPayload(
@@ -820,7 +978,10 @@ class InMemoryTvControlRepository @Inject constructor(
             return
         }
 
-        if (connectionStateFlow.value !is ConnectionState.Ready) {
+        val currentState = connectionStateFlow.value
+        val allowLegacyProbe = currentState is ConnectionState.ConnectedNotReady &&
+            awaitingLegacyFirstCommand
+        if (currentState !is ConnectionState.Ready && !allowLegacyProbe) {
             diagnosticsTracker.recordError(
                 context = "legacy_send_key_not_ready",
                 errorMessage = "encrypted key send blocked because legacy command channel is not ready",
@@ -842,12 +1003,108 @@ class InMemoryTvControlRepository @Inject constructor(
             return
         }
 
-        runCatching {
-            withContext(Dispatchers.IO) {
-                legacyTcpClient.sendKey(keyCode)
+        try {
+            val credentials = activeSpcCredentials
+                ?: activeSpcIdentifier
+                    ?.let { identifier ->
+                        sensitivePairingStorage.loadSpcCredentials(identifier)
+                            ?.takeIf { isValidSpcCredentials(it) }
+                    }
+                ?: throw IllegalStateException("Encrypted session is missing. Reconnect and pair again.")
+
+            val sendResult = runCatching {
+                spcWebSocketClient.sendKey(
+                    keyCode = keyCode,
+                    ctxUpperHex = credentials.ctxUpperHex,
+                    sessionId = credentials.sessionId
+                )
             }
-        }.onFailure { error ->
-            val message = error.message ?: "Failed to send remote key over legacy path."
+
+            if (sendResult.isFailure) {
+                val firstFailureMessage = sendResult.exceptionOrNull()?.message.orEmpty()
+                val needsReconnectRetry = firstFailureMessage.contains(
+                    "spc socket is not connected",
+                    ignoreCase = true
+                )
+
+                if (needsReconnectRetry && !awaitingLegacyFirstCommand) {
+                    diagnosticsTracker.log(
+                        category = DiagnosticsCategory.RECONNECT,
+                        message = "spc key send failed with disconnected socket; retrying reconnect once",
+                        metadata = mapOf("tvId" to tv.id)
+                    )
+
+                    val reconnected = connectSpcCommandChannel(
+                        tv = tv,
+                        credentials = credentials,
+                        shouldPersistAfterConnect = false,
+                        awaitFirstCommand = awaitingLegacyFirstCommand,
+                        credentialSource = activeLegacyCredentialsSource
+                    )
+                    if (reconnected) {
+                        spcWebSocketClient.sendKey(
+                            keyCode = keyCode,
+                            ctxUpperHex = credentials.ctxUpperHex,
+                            sessionId = credentials.sessionId
+                        )
+                    } else {
+                        throw IllegalStateException(
+                            "SPC socket disconnected and reconnect failed. Retry connect."
+                        )
+                    }
+                } else {
+                    throw sendResult.exceptionOrNull() ?: IllegalStateException(
+                        "Failed to send remote key over encrypted path."
+                    )
+                }
+            }
+            if (awaitingLegacyFirstCommand) {
+                connectionMutex.withLock {
+                    awaitingLegacyFirstCommand = false
+                    activeLegacyCredentialsSource = null
+                    readyForCommands = true
+                    activeLegacyPairing = false
+                    connectionStateFlow.value = ConnectionState.Ready(tv.id)
+                }
+                diagnosticsTracker.log(
+                    category = DiagnosticsCategory.LIFECYCLE,
+                    message = "encrypted session confirmed by first command",
+                    metadata = mapOf("tvId" to tv.id)
+                )
+            }
+        } catch (error: CancellationException) {
+            return
+        } catch (error: Throwable) {
+            val rawMessage = error.message ?: "Failed to send remote key over encrypted path."
+            if (rawMessage.contains("cancelled", ignoreCase = true)) {
+                return
+            }
+
+            if (awaitingLegacyFirstCommand &&
+                activeLegacyCredentialsSource == LegacyEncryptedSessionCoordinator.CredentialSource.STORED
+            ) {
+                recoverStoredSpcSessionToFreshPairing(
+                    tv = tv,
+                    failureMessage = rawMessage
+                )
+                return
+            }
+
+            val staleMessage = isSpcStaleError(rawMessage)
+            val message = if (staleMessage) {
+                "Encrypted session expired. Tap Connect and pair again."
+            } else {
+                rawMessage
+            }
+
+            if (staleMessage) {
+                val identifier = activeSpcIdentifier ?: pairingIdentifierFor(tv)
+                sensitivePairingStorage.deleteSensitiveData(identifier)
+                activeSpcCredentials = null
+                activeSpcIdentifier = null
+                readyForCommands = false
+            }
+
             connectionStateFlow.value = ConnectionState.Error(message)
             diagnosticsTracker.recordError(
                 context = "legacy_send_key_failed",
@@ -856,6 +1113,58 @@ class InMemoryTvControlRepository @Inject constructor(
                     "tvId" to tv.id,
                     "key" to key.name
                 )
+            )
+        }
+    }
+
+    private suspend fun recoverStoredSpcSessionToFreshPairing(
+        tv: SamsungTv,
+        failureMessage: String
+    ) {
+        val transition = legacyCoordinator.onFirstCommand(
+            tvId = tv.id,
+            source = LegacyEncryptedSessionCoordinator.CredentialSource.STORED
+        )
+        val identifier = activeSpcIdentifier ?: pairingIdentifierFor(tv)
+        connectionMutex.withLock {
+            spcWebSocketClient.disconnect()
+            sensitivePairingStorage.deleteSensitiveData(identifier)
+            activeSpcCredentials = null
+            activeSpcIdentifier = null
+            readyForCommands = false
+            activeLegacyPairing = transition.emittedStates.any {
+                it is ConnectionState.Pairing || it is ConnectionState.PinRequired
+            }
+            awaitingLegacyFirstCommand = transition.awaitingFirstCommand
+            activeLegacyCredentialsSource = transition.credentialSource
+            transition.emittedStates.forEach { state ->
+                connectionStateFlow.value = state
+            }
+        }
+
+        diagnosticsTracker.log(
+            category = DiagnosticsCategory.PAIRING,
+            message = "stored spc first command failed; entering fresh pairing",
+            metadata = mapOf("tvId" to tv.id)
+        )
+        diagnosticsTracker.recordError(
+            context = "legacy_first_command_stale",
+            errorMessage = failureMessage,
+            metadata = mapOf("tvId" to tv.id)
+        )
+
+        val pairingPreparationError = runCatching {
+            spcHandshakeClient.startPairing(tv.ipAddress)
+        }.exceptionOrNull()
+
+        if (pairingPreparationError != null) {
+            val message = pairingPreparationError.message
+                ?: "Could not open the PIN page on TV. Keep the TV awake and retry."
+            connectionStateFlow.value = ConnectionState.Error(message)
+            diagnosticsTracker.recordError(
+                context = "legacy_prepare_pin_page",
+                errorMessage = message,
+                metadata = mapOf("tvId" to tv.id)
             )
         }
     }
@@ -978,89 +1287,27 @@ class InMemoryTvControlRepository @Inject constructor(
             port = 8001,
             timeoutMs = SUBNET_PROBE_PORT_TIMEOUT_MS
         )
-        val legacyRemotePortOpen = LEGACY_REMOTE_PORTS.any { port ->
-            isTcpPortOpen(
-                ipAddress = ipAddress,
-                port = port,
-                timeoutMs = SUBNET_PROBE_PORT_TIMEOUT_MS
-            )
-        }
+        val legacySpcPortOpen = isTcpPortOpen(
+            ipAddress = ipAddress,
+            port = LEGACY_SPC_SOCKET_PORT,
+            timeoutMs = SUBNET_PROBE_PORT_TIMEOUT_MS
+        )
         val legacyPairingPortOpen = isTcpPortOpen(
             ipAddress = ipAddress,
             port = 8080,
             timeoutMs = SUBNET_PROBE_PORT_TIMEOUT_MS
         )
 
-        if (!modernPortOpen && !legacyRemotePortOpen && !legacyPairingPortOpen) {
+        if (!modernPortOpen && !legacySpcPortOpen && !legacyPairingPortOpen) {
             return null
         }
 
         return fetchTvInfoWithFallback(
             ipAddress = ipAddress,
             client = restProbeClient,
-            knownLegacyRemotePortOpen = legacyRemotePortOpen,
+            knownLegacySpcPortOpen = legacySpcPortOpen,
             knownLegacyPairingPortOpen = legacyPairingPortOpen
         )
-    }
-
-    private suspend fun prepareLegacyPinPage(ipAddress: String): Boolean {
-        return withContext(Dispatchers.IO) {
-            val pinUrl = "http://$ipAddress:8080/ws/apps/CloudPINPage"
-            val pinRunUrl = "http://$ipAddress:8080/ws/apps/CloudPINPage/run"
-
-            runCatching {
-                val deleteRequest = Request.Builder()
-                    .url(pinRunUrl)
-                    .delete()
-                    .build()
-                restClient.newCall(deleteRequest).execute().close()
-            }
-
-            runCatching {
-                val getRequest = Request.Builder()
-                    .url(pinUrl)
-                    .get()
-                    .build()
-                restClient.newCall(getRequest).execute().close()
-            }
-
-            val postResponse = runCatching {
-                val request = Request.Builder()
-                    .url(pinUrl)
-                    .post("pin4".toRequestBody())
-                    .build()
-                restClient.newCall(request).execute()
-            }.getOrNull() ?: return@withContext false
-
-            postResponse.use { response ->
-                if (!response.isSuccessful) {
-                    return@withContext false
-                }
-            }
-
-            repeat(PIN_PAGE_RUNNING_CHECK_ATTEMPTS) {
-                val stateBody = runCatching {
-                    val stateRequest = Request.Builder()
-                        .url(pinUrl)
-                        .get()
-                        .build()
-                    restClient.newCall(stateRequest).execute().use { response ->
-                        if (!response.isSuccessful) {
-                            return@use ""
-                        }
-                        response.body?.string().orEmpty()
-                    }
-                }.getOrDefault("")
-
-                if (stateBody.contains("<state>running</state>", ignoreCase = true)) {
-                    return@withContext true
-                }
-
-                delay(PIN_PAGE_RUNNING_CHECK_INTERVAL_MS)
-            }
-
-            false
-        }
     }
 
     private fun acquireMulticastLock(): WifiManager.MulticastLock? {
@@ -1235,11 +1482,16 @@ class InMemoryTvControlRepository @Inject constructor(
                 } else {
                     deviceName
                 }
+                val protocol = if (isLikelyLegacyEncryptedModel(modelName)) {
+                    TvProtocol.LEGACY_ENCRYPTED
+                } else {
+                    TvProtocol.MODERN
+                }
                 SamsungTv(
                     id = tvIdForIp(normalizedIp),
                     displayName = displayName,
                     ipAddress = normalizedIp,
-                    protocol = TvProtocol.MODERN,
+                    protocol = protocol,
                     capabilities = DEFAULT_CAPABILITIES,
                     modelName = modelName,
                     macAddress = wifiMac
@@ -1252,7 +1504,7 @@ class InMemoryTvControlRepository @Inject constructor(
         ipAddress: String,
         client: OkHttpClient = restClient,
         fallbackDisplayName: String? = null,
-        knownLegacyRemotePortOpen: Boolean? = null,
+        knownLegacySpcPortOpen: Boolean? = null,
         knownLegacyPairingPortOpen: Boolean? = null
     ): SamsungTv? {
         val modern = fetchModernTvInfo(
@@ -1260,13 +1512,16 @@ class InMemoryTvControlRepository @Inject constructor(
             client = client
         )
         if (modern != null) {
+            if (shouldPreferLegacyEncrypted(tv = modern)) {
+                return modern.copy(protocol = TvProtocol.LEGACY_ENCRYPTED)
+            }
             return modern
         }
 
         return fetchLegacyTvInfo(
             ipAddress = ipAddress,
             fallbackDisplayName = fallbackDisplayName,
-            knownLegacyRemotePortOpen = knownLegacyRemotePortOpen,
+            knownLegacySpcPortOpen = knownLegacySpcPortOpen,
             knownLegacyPairingPortOpen = knownLegacyPairingPortOpen
         )
     }
@@ -1274,38 +1529,28 @@ class InMemoryTvControlRepository @Inject constructor(
     private suspend fun fetchLegacyTvInfo(
         ipAddress: String,
         fallbackDisplayName: String?,
-        knownLegacyRemotePortOpen: Boolean?,
+        knownLegacySpcPortOpen: Boolean?,
         knownLegacyPairingPortOpen: Boolean?
     ): SamsungTv? {
         val normalizedIp = normalizeIpv4(ipAddress) ?: return null
-        val legacyRemotePortOpen = knownLegacyRemotePortOpen ?: LEGACY_REMOTE_PORTS.any { port ->
-            isTcpPortOpen(
-                ipAddress = normalizedIp,
-                port = port,
-                timeoutMs = 700
-            )
-        }
+        val legacySpcPortOpen = knownLegacySpcPortOpen ?: isTcpPortOpen(
+            ipAddress = normalizedIp,
+            port = LEGACY_SPC_SOCKET_PORT,
+            timeoutMs = 700
+        )
         val legacyPairingPortOpen = knownLegacyPairingPortOpen ?: isTcpPortOpen(
             ipAddress = normalizedIp,
             port = 8080,
             timeoutMs = 700
         )
 
-        if (!legacyRemotePortOpen && !legacyPairingPortOpen) {
+        if (!legacySpcPortOpen && !legacyPairingPortOpen) {
             return null
         }
 
-        val protocol = if (legacyPairingPortOpen) {
-            TvProtocol.LEGACY_ENCRYPTED
-        } else {
-            TvProtocol.LEGACY_REMOTE
-        }
+        val protocol = TvProtocol.LEGACY_ENCRYPTED
         val label = fallbackDisplayName?.takeIf { it.isNotBlank() } ?: "Samsung TV"
-        val model = if (protocol == TvProtocol.LEGACY_ENCRYPTED) {
-            "Legacy Encrypted TV"
-        } else {
-            "Legacy TV"
-        }
+        val model = "Legacy Encrypted TV"
 
         return SamsungTv(
             id = tvIdForIp(normalizedIp),
@@ -1316,6 +1561,35 @@ class InMemoryTvControlRepository @Inject constructor(
             modelName = model,
             macAddress = ""
         )
+    }
+
+    private fun shouldPreferLegacyEncrypted(tv: SamsungTv): Boolean {
+        if (tv.protocol == TvProtocol.LEGACY_ENCRYPTED) {
+            return true
+        }
+
+        if (isLikelyLegacyEncryptedModel(tv.modelName)) {
+            return true
+        }
+        return false
+    }
+
+    private fun isLikelyLegacyEncryptedModel(modelName: String): Boolean {
+        val model = modelName.uppercase()
+        if (model.isBlank()) {
+            return false
+        }
+
+        if (model.contains("LS") || model.contains("QN")) {
+            return false
+        }
+
+        if (model.contains("JU") || model.contains("JS")) {
+            return true
+        }
+
+        val hasLegacySeriesMarker = Regex(".*[HJ][0-9]{3,4}.*").matches(model)
+        return hasLegacySeriesMarker
     }
 
     private fun persistToSavedTvs(tv: SamsungTv) {
@@ -1367,6 +1641,7 @@ class InMemoryTvControlRepository @Inject constructor(
                 val sessionId = extractSessionIdentifier(text)
                 if (!sessionId.isNullOrBlank()) {
                     activeModernSessionId = sessionId
+                    modernSessionRefreshAttempted = false
                 }
                 when (eventName) {
                     EVENT_CHANNEL_CONNECT,
@@ -1404,6 +1679,32 @@ class InMemoryTvControlRepository @Inject constructor(
                     }
 
                     EVENT_CHANNEL_ERROR -> {
+                        if (isMissingSessionReason(reason)) {
+                            if (activeModernSessionId.isNullOrBlank() && !modernSessionRefreshAttempted) {
+                                modernSessionRefreshAttempted = true
+                                val refreshSent = sendSessionRefreshRequest(
+                                    webSocket = webSocket,
+                                    tvId = tvId
+                                )
+                                if (refreshSent) {
+                                    diagnosticsTracker.log(
+                                        category = DiagnosticsCategory.PROTOCOL,
+                                        message = "modern session refresh requested after missing-session error",
+                                        metadata = mapOf("tvId" to tvId)
+                                    )
+                                    return
+                                }
+                            }
+
+                            handleSocketFailure(
+                                tvId = tvId,
+                                signal = signal,
+                                context = "socket_session_missing",
+                                message = "TV session is not ready yet. Retry connect."
+                            )
+                            return
+                        }
+
                         if (applyModernModeFallbackIfNeeded(
                                 tvId = tvId,
                                 reason = reason
@@ -1504,10 +1805,16 @@ class InMemoryTvControlRepository @Inject constructor(
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 val rawMessage = t.message ?: "Unknown modern connection failure"
-                val message = if (rawMessage.contains("socket closed", ignoreCase = true)) {
-                    "TV closed the connection before authorization completed. If the TV shows an Allow prompt, accept it and retry."
-                } else {
-                    rawMessage
+                val message = when {
+                    rawMessage.contains("socket closed", ignoreCase = true) -> {
+                        "TV closed the connection before authorization completed. If the TV shows an Allow prompt, accept it and retry."
+                    }
+
+                    isMissingSessionReason(rawMessage) -> {
+                        "TV session is not ready yet. Retry connect."
+                    }
+
+                    else -> rawMessage
                 }
                 if (isAuthorizationFailure(message)) {
                     modernUnauthorizedEvent = true
@@ -1527,7 +1834,6 @@ class InMemoryTvControlRepository @Inject constructor(
         reason: String
     ): Boolean {
         val normalized = reason.lowercase()
-        val missingSession = normalized.contains("cannot read property 'session' of null")
         val invalidRemoteControlMethod = normalized.contains("unrecognized method value : ms.remote.control")
         val invalidChannelEmitMethod = normalized.contains("unrecognized method value : ms.channel.emit")
 
@@ -1543,7 +1849,8 @@ class InMemoryTvControlRepository @Inject constructor(
             }
 
             activeModernCommandMode == ModernCommandMode.EMIT_KEYPRESS &&
-                (missingSession || invalidChannelEmitMethod) -> {
+                invalidChannelEmitMethod &&
+                !activeModernSessionId.isNullOrBlank() -> {
                 activeModernCommandMode = ModernCommandMode.EMIT_KEYPRESS_WITH_SESSION
                 diagnosticsTracker.log(
                     category = DiagnosticsCategory.PROTOCOL,
@@ -1553,7 +1860,9 @@ class InMemoryTvControlRepository @Inject constructor(
                 true
             }
 
-            activeModernCommandMode == ModernCommandMode.EMIT_KEYPRESS_WITH_SESSION && missingSession -> {
+            activeModernCommandMode == ModernCommandMode.EMIT_KEYPRESS_WITH_SESSION &&
+                !activeModernSessionId.isNullOrBlank() &&
+                isMissingSessionReason(reason) -> {
                 activeModernCommandMode = ModernCommandMode.EMIT_REMOTE_CONTROL_WITH_SESSION
                 diagnosticsTracker.log(
                     category = DiagnosticsCategory.PROTOCOL,
@@ -1585,6 +1894,7 @@ class InMemoryTvControlRepository @Inject constructor(
         activeTv = null
         activeModernSessionId = null
         activeModernCommandMode = ModernCommandMode.REMOTE_CONTROL
+        modernSessionRefreshAttempted = false
         connectionStateFlow.value = ConnectionState.Error(message)
         diagnosticsTracker.recordError(
             context = context,
@@ -1597,10 +1907,14 @@ class InMemoryTvControlRepository @Inject constructor(
         activeSocket?.cancel()
         activeSocket = null
         legacyTcpClient.disconnect()
+        spcWebSocketClient.disconnect()
         activeTv = null
         readyForCommands = false
         activeModernCommandMode = ModernCommandMode.REMOTE_CONTROL
         activeModernSessionId = null
+        modernSessionRefreshAttempted = false
+        activeSpcCredentials = null
+        activeSpcIdentifier = null
         activeTransport = ActiveTransport.MODERN
         activeLegacyPairing = false
         awaitingLegacyFirstCommand = false
@@ -1786,12 +2100,61 @@ class InMemoryTvControlRepository @Inject constructor(
             || normalized.contains("reject")
     }
 
-    private fun isLegacyModel(modelName: String): Boolean {
-        val upperModel = modelName.uppercase()
-        return listOf(
-            "JU", "JS", "J6", "J5", "J4",
-            "HU", "HS", "H6", "H5", "H4"
-        ).any { marker -> upperModel.contains(marker) }
+    private fun isMissingSessionReason(message: String): Boolean {
+        val normalized = message.lowercase()
+        return normalized.contains("cannot read property 'session' of null")
+            || normalized.contains("session is null")
+            || normalized.contains("no session")
+    }
+
+    private fun isSpcStaleError(message: String): Boolean {
+        val normalized = message.lowercase()
+        return normalized.contains("stale")
+            || normalized.contains("session expired")
+            || normalized.contains("spc credentials")
+            || normalized.contains("encrypted session is missing")
+            || normalized.contains("unsupported key size")
+    }
+
+    private fun isValidSpcCredentials(credentials: SpcCredentials): Boolean {
+        return credentials.sessionId > 0 && isValidSpcContextHex(credentials.ctxUpperHex)
+    }
+
+    private fun isValidSpcContextHex(ctxUpperHex: String): Boolean {
+        if (ctxUpperHex.length != 32) {
+            return false
+        }
+        return ctxUpperHex.all { character ->
+            character in '0'..'9' || character in 'a'..'f' || character in 'A'..'F'
+        }
+    }
+
+    private fun requiresSession(mode: ModernCommandMode): Boolean {
+        return mode == ModernCommandMode.EMIT_KEYPRESS_WITH_SESSION ||
+            mode == ModernCommandMode.EMIT_REMOTE_CONTROL_WITH_SESSION
+    }
+
+    private fun sendSessionRefreshRequest(
+        webSocket: WebSocket,
+        tvId: String
+    ): Boolean {
+        val params = JSONObject().put("name", Base64.encodeToString(
+            MODERN_CLIENT_NAME.toByteArray(StandardCharsets.UTF_8),
+            Base64.NO_WRAP
+        ))
+        val payload = JSONObject()
+            .put("method", EVENT_CHANNEL_CONNECT)
+            .put("params", params)
+            .toString()
+        val sent = webSocket.send(payload)
+        if (!sent) {
+            diagnosticsTracker.recordError(
+                context = "socket_session_refresh",
+                errorMessage = "failed to send modern session refresh request",
+                metadata = mapOf("tvId" to tvId)
+            )
+        }
+        return sent
     }
 
     private fun pairingIdentifierFor(tv: SamsungTv): String {
@@ -1890,12 +2253,10 @@ class InMemoryTvControlRepository @Inject constructor(
         private const val CONNECTION_READY_TIMEOUT_MS = 20_000L
         private const val DISCOVERY_SCAN_TIMEOUT_MS = 4_500L
         private const val RESOLVE_TIMEOUT_MS = 1_500L
-        private const val PIN_PAGE_RUNNING_CHECK_ATTEMPTS = 8
-        private const val PIN_PAGE_RUNNING_CHECK_INTERVAL_MS = 250L
         private const val SUBNET_DISCOVERY_CONCURRENCY = 36
         private const val SUBNET_PROBE_PORT_TIMEOUT_MS = 250
         private const val MODERN_CLIENT_NAME = "SamsungTVRemote"
-        private val LEGACY_REMOTE_PORTS = listOf(55_000, 55_001, 52_235)
+        private const val LEGACY_SPC_SOCKET_PORT = 8000
 
         private const val EVENT_CHANNEL_CONNECT = "ms.channel.connect"
         private const val EVENT_CHANNEL_CLIENT_CONNECT = "ms.channel.clientConnect"

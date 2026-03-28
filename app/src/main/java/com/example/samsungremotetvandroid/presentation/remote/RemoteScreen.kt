@@ -56,7 +56,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
@@ -74,6 +73,7 @@ import com.example.samsungremotetvandroid.core.design.SamsungSpacing
 import com.example.samsungremotetvandroid.domain.model.ConnectionState
 import com.example.samsungremotetvandroid.domain.model.RemoteKey
 import com.example.samsungremotetvandroid.domain.model.SamsungTv
+import com.example.samsungremotetvandroid.domain.model.TvProtocol
 
 @Composable
 fun RemoteScreen(
@@ -93,7 +93,10 @@ fun RemoteScreen(
     val connectInFlight by viewModel.connectInFlight.collectAsStateWithLifecycle()
 
     val selectedTv = availableTvs.firstOrNull { it.id == selectedTvId }
-    val controlsEnabled = connectionState is ConnectionState.Ready && !connectInFlight
+    val legacyProbeEnabled = connectionState is ConnectionState.ConnectedNotReady &&
+        selectedTv?.protocol == TvProtocol.LEGACY_ENCRYPTED
+    val controlsEnabled = (connectionState is ConnectionState.Ready || legacyProbeEnabled) &&
+        !connectInFlight
     val context = LocalContext.current
     val hapticFeedback = LocalHapticFeedback.current
     val isDebuggable = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
@@ -111,7 +114,7 @@ fun RemoteScreen(
                 brush = Brush.verticalGradient(
                     colors = listOf(
                         MaterialTheme.colorScheme.surface,
-                        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.42f)
+                        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.25f)
                     )
                 )
             )
@@ -131,8 +134,7 @@ fun RemoteScreen(
 
             RemoteStatusCard(
                 connectionState = connectionState,
-                selectedTv = selectedTv,
-                controlsEnabled = controlsEnabled
+                selectedTv = selectedTv
             )
 
             TargetSelectorCard(
@@ -207,39 +209,48 @@ private fun RemoteTopBar(
     onOpenDiscovery: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
-    Row(
+    Card(
         modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant
+        )
     ) {
-        IconButton(onClick = onOpenDiscovery) {
-            Icon(
-                imageVector = Icons.AutoMirrored.Outlined.ArrowBack,
-                contentDescription = stringResource(id = R.string.common_back)
-            )
-        }
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(SamsungSpacing.SpacingSm),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = onOpenDiscovery) {
+                Icon(
+                    imageVector = Icons.AutoMirrored.Outlined.ArrowBack,
+                    contentDescription = stringResource(id = R.string.common_back)
+                )
+            }
 
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(
-                text = selectedTv?.displayName ?: stringResource(id = R.string.remote_title),
-                style = MaterialTheme.typography.titleLarge,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-            Text(
-                text = selectedTv?.ipAddress ?: stringResource(id = R.string.remote_header_no_target),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-        }
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(
+                    text = selectedTv?.displayName ?: stringResource(id = R.string.remote_title),
+                    style = MaterialTheme.typography.titleLarge,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = selectedTv?.ipAddress ?: stringResource(id = R.string.remote_header_no_target),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
 
-        IconButton(onClick = onOpenSettings) {
-            Icon(
-                imageVector = Icons.Outlined.Settings,
-                contentDescription = stringResource(id = R.string.nav_settings)
-            )
+            IconButton(onClick = onOpenSettings) {
+                Icon(
+                    imageVector = Icons.Outlined.Settings,
+                    contentDescription = stringResource(id = R.string.nav_settings)
+                )
+            }
         }
     }
 }
@@ -247,13 +258,12 @@ private fun RemoteTopBar(
 @Composable
 private fun RemoteStatusCard(
     connectionState: ConnectionState,
-    selectedTv: SamsungTv?,
-    controlsEnabled: Boolean
+    selectedTv: SamsungTv?
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.72f)
+            containerColor = MaterialTheme.colorScheme.secondaryContainer
         )
     ) {
         Column(
@@ -272,10 +282,15 @@ private fun RemoteStatusCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Text(
-                text = if (controlsEnabled) {
-                    stringResource(id = R.string.remote_controls_ready_hint)
-                } else {
-                    stringResource(id = R.string.remote_controls_locked_hint)
+                text = when {
+                    connectionState is ConnectionState.Ready -> {
+                        stringResource(id = R.string.remote_controls_ready_hint)
+                    }
+                    connectionState is ConnectionState.ConnectedNotReady &&
+                        selectedTv?.protocol == TvProtocol.LEGACY_ENCRYPTED -> {
+                        stringResource(id = R.string.remote_controls_probe_hint)
+                    }
+                    else -> stringResource(id = R.string.remote_controls_locked_hint)
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -354,7 +369,12 @@ private fun TargetSelectorCard(
     onConnect: () -> Unit,
     onDisconnect: () -> Unit
 ) {
-    Card(modifier = Modifier.fillMaxWidth()) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant
+        )
+    ) {
         Column(
             modifier = Modifier.padding(SamsungSpacing.SpacingMd),
             verticalArrangement = Arrangement.spacedBy(SamsungSpacing.SpacingSm)
@@ -423,7 +443,7 @@ private fun ControlsCard(
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.62f)
+            containerColor = MaterialTheme.colorScheme.surfaceVariant
         )
     ) {
         Column(
@@ -474,7 +494,7 @@ private fun ControlsCard(
                 modifier = Modifier
                     .clip(RoundedCornerShape(SamsungRadii.RadiusLg))
                     .fillMaxWidth(),
-                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.45f)
+                color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.65f)
             ) {
                 Column(
                     modifier = Modifier
@@ -772,7 +792,7 @@ private fun IconControlButton(
     val container = if (emphasized) {
         MaterialTheme.colorScheme.primary
     } else {
-        MaterialTheme.colorScheme.surface.copy(alpha = 0.82f)
+        MaterialTheme.colorScheme.secondaryContainer
     }
     val content = if (emphasized) {
         MaterialTheme.colorScheme.onPrimary
@@ -820,7 +840,7 @@ private fun HoldIconControlButton(
                     }
                 )
             },
-        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.82f),
+        color = MaterialTheme.colorScheme.secondaryContainer,
         contentColor = MaterialTheme.colorScheme.onSurface,
         shadowElevation = 0.dp
     ) {

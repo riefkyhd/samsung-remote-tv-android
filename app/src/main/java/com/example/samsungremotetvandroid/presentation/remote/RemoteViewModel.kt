@@ -8,6 +8,7 @@ import com.example.samsungremotetvandroid.domain.model.ConnectionState
 import com.example.samsungremotetvandroid.domain.model.RemoteKey
 import com.example.samsungremotetvandroid.domain.model.SamsungTv
 import com.example.samsungremotetvandroid.domain.model.TvCapability
+import com.example.samsungremotetvandroid.domain.model.TvProtocol
 import com.example.samsungremotetvandroid.domain.usecase.ObserveDiscoveredTvsUseCase
 import com.example.samsungremotetvandroid.domain.usecase.CancelEncryptedPairingUseCase
 import com.example.samsungremotetvandroid.domain.usecase.CompleteEncryptedPairingUseCase
@@ -18,6 +19,7 @@ import com.example.samsungremotetvandroid.domain.usecase.ObserveSavedTvsUseCase
 import com.example.samsungremotetvandroid.domain.usecase.SendRemoteKeyUseCase
 import dagger.hilt.android.lifecycle.HiltViewModel
 import javax.inject.Inject
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -138,6 +140,9 @@ class RemoteViewModel @Inject constructor(
             runCatching {
                 connectToTvUseCase(tvId)
             }.onFailure { error ->
+                if (error is CancellationException || error.message?.contains("cancelled", ignoreCase = true) == true) {
+                    return@onFailure
+                }
                 diagnosticsTracker.recordError(
                     context = "remote_connect",
                     errorMessage = error.message ?: "failed to connect requested tv",
@@ -182,6 +187,11 @@ class RemoteViewModel @Inject constructor(
     }
 
     fun startKeyHold(key: RemoteKey) {
+        val state = connectionState.value
+        if (state is ConnectionState.ConnectedNotReady && isActiveLegacyEncryptedTv()) {
+            sendRemoteKey(key)
+            return
+        }
         if (key !in HOLD_REPEAT_KEYS) {
             sendRemoteKey(key)
             return
@@ -276,7 +286,10 @@ class RemoteViewModel @Inject constructor(
     }
 
     private suspend fun sendRemoteKeyInternal(key: RemoteKey) {
-        if (connectionState.value !is ConnectionState.Ready) {
+        val currentState = connectionState.value
+        val allowLegacyProbe = currentState is ConnectionState.ConnectedNotReady &&
+            isActiveLegacyEncryptedTv()
+        if (currentState !is ConnectionState.Ready && !allowLegacyProbe) {
             val message = "Remote controls are locked until this TV is ready."
             showUserMessage(message)
             diagnosticsTracker.recordError(
@@ -292,12 +305,23 @@ class RemoteViewModel @Inject constructor(
         runCatching {
             sendRemoteKeyUseCase(key)
         }.onFailure { error ->
+            if (error is kotlinx.coroutines.CancellationException) {
+                return@onFailure
+            }
             diagnosticsTracker.recordError(
                 context = "remote_send_key",
                 errorMessage = error.message ?: "failed to send remote key",
                 metadata = mapOf("key" to key.name)
             )
         }
+    }
+
+    private fun isActiveLegacyEncryptedTv(): Boolean {
+        val tvId = activeTvId(connectionState.value) ?: selectedTvIdFlow.value ?: return false
+        val tv = savedTvs.value.firstOrNull { it.id == tvId }
+            ?: discoveredTvs.value.firstOrNull { it.id == tvId }
+            ?: return false
+        return tv.protocol == TvProtocol.LEGACY_ENCRYPTED
     }
 
     private fun isRemoteKeySupported(key: RemoteKey): Boolean {

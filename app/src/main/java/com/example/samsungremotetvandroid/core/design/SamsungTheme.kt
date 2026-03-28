@@ -17,32 +17,41 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 
 private val SamsungLightScheme = lightColorScheme(
-    primary = Color(0xFF1B5EBE),
+    primary = Color(0xFF0D63CE),
     onPrimary = Color(0xFFFFFFFF),
-    surface = Color(0xFFF6F8FC),
-    onSurface = Color(0xFF101726),
-    surfaceVariant = Color(0xFFE5EBF4),
-    onSurfaceVariant = Color(0xFF3D4A61),
-    secondary = Color(0xFF1E4D8C),
+    primaryContainer = Color(0xFFD8E7FF),
+    onPrimaryContainer = Color(0xFF062C5E),
+    surface = Color(0xFFF1F4FA),
+    onSurface = Color(0xFF0E1728),
+    surfaceVariant = Color(0xFFDCE3EF),
+    onSurfaceVariant = Color(0xFF2D3B52),
+    secondary = Color(0xFF20518F),
     onSecondary = Color(0xFFFFFFFF),
+    secondaryContainer = Color(0xFFDAE7FF),
+    onSecondaryContainer = Color(0xFF06284F),
     error = Color(0xFFB3261E),
     onError = Color(0xFFFFFFFF)
 )
 
 private val SamsungDarkScheme = darkColorScheme(
-    primary = Color(0xFF9EC6FF),
-    onPrimary = Color(0xFF00315F),
-    surface = Color(0xFF111726),
-    onSurface = Color(0xFFE2E9F7),
-    surfaceVariant = Color(0xFF2A3448),
-    onSurfaceVariant = Color(0xFFC2CEE3),
-    secondary = Color(0xFFB6CCF5),
-    onSecondary = Color(0xFF0E325F),
+    primary = Color(0xFF8AB4FF),
+    onPrimary = Color(0xFF002F67),
+    primaryContainer = Color(0xFF123A72),
+    onPrimaryContainer = Color(0xFFD9E7FF),
+    surface = Color(0xFF0C121D),
+    onSurface = Color(0xFFE8EEF9),
+    surfaceVariant = Color(0xFF1E283A),
+    onSurfaceVariant = Color(0xFFD4DEEF),
+    secondary = Color(0xFFAAC7F5),
+    onSecondary = Color(0xFF0A315F),
+    secondaryContainer = Color(0xFF263957),
+    onSecondaryContainer = Color(0xFFDCE7FF),
     error = Color(0xFFFFB4AB),
     onError = Color(0xFF690005)
 )
 
 private val SamsungTypography = Typography(
+    headlineLarge = Typography().headlineLarge.copy(fontWeight = FontWeight.Bold),
     headlineMedium = Typography().headlineMedium.copy(fontWeight = FontWeight.SemiBold),
     titleLarge = Typography().titleLarge.copy(fontWeight = FontWeight.SemiBold),
     titleMedium = Typography().titleMedium.copy(fontWeight = FontWeight.Medium),

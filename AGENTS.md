@@ -7,7 +7,7 @@ This repository contains the Android migration of the Samsung TV remote app.
 Build a native Android app in Kotlin + Jetpack Compose that matches the current iOS app as closely as possible in:
 
 - user-visible behavior
-- screen structuree
+- screen structure
 - interaction model
 - capability boundaries
 - pairing/recovery truthfulness
@@ -36,13 +36,66 @@ Primary behavioral reference for this Android migration:
 
 Recommended known iOS baseline checkpoints:
 - `87b91f4` — final v1 stabilization sweep baseline
-- `853fff0` — includes later JU/UX-related work already discussed
+- `853fff0` — later accepted iOS state including JU/UX-related follow-up work
 - If a newer accepted iOS commit is explicitly provided in a task, use that commit as the temporary reference point for that phase.
 
 Rules:
 - Treat the iOS repo as the source of truth for behavior, UX flow, capability truthfulness, pairing/reset semantics, diagnostics discipline, and release-boundary wording.
 - Do not copy blindly if Android platform constraints require a different implementation, but preserve user-visible behavior as closely as practical.
-- If Android intentionally diverges from iOS behavior, explain why in the task summary and update parity tracking docs if needed.
+- If Android intentionally diverges from iOS behavior, explain why in the task summary and update parity-tracking docs if needed.
+
+---
+
+## Required Docs
+
+Before starting any significant phase, read these files:
+
+- `docs/android/ROADMAP_ANDROID_MIGRATION.md`
+- `docs/android/FEATURE_PARITY_MATRIX.md`
+- `docs/android/IMPLEMENTATION_BACKLOG_ANDROID.md`
+- `docs/android/UI_PARITY_GUIDE.md`
+- `docs/android/TASKING_PROMPTS_ANDROID.md`
+- `docs/android/PHASE_REPORT_TEMPLATE.md` (if phase reporting is needed)
+
+Treat them as required inputs, not optional references.
+
+---
+
+## Preferred Skills
+
+If the repo contains these skills, prefer using them when relevant:
+
+- `.agents/skills/frontend-ui-build`
+- `.agents/skills/frontend-design-parity`
+- `.agents/skills/frontend-accessibility`
+- `.agents/skills/frontend-testing`
+- `.agents/skills/frontend-figma-handoff`
+
+Use them as follows:
+- `frontend-ui-build` for screen/component implementation
+- `frontend-design-parity` for matching the iOS app or screenshot reference
+- `frontend-accessibility` for labels, contrast, semantics, and large-text/readability work
+- `frontend-testing` for component/interaction/regression tests
+- `frontend-figma-handoff` when a Figma or screenshot-based design handoff is being used
+
+Do not force a skill if it does not fit the task.
+
+---
+
+## Visual Reference Evidence
+
+The `evidence/` folder contains iOS app screenshots and other visual references for Android migration work.
+
+Rules:
+- Treat iOS screenshots in `evidence/` as visual parity references.
+- Use them to preserve:
+    - layout hierarchy
+    - spacing rhythm
+    - control grouping
+    - state presentation
+    - wording/tone where relevant
+- Do not copy blindly if Android platform conventions require adjustment, but preserve product meaning as closely as practical.
+- If Android intentionally diverges from the screenshot reference, explain why in the task summary.
 
 ---
 
@@ -100,10 +153,13 @@ Prefer this implementation order:
 4. settings and diagnostics parity
 5. legacy encrypted/JU path parity
 6. polish parity
+7. E2E / release-readiness work
 
 Do not attempt full parity in one giant pass.
 
 Break work into narrow phases with clear acceptance criteria.
+
+Do not let later phases silently reopen earlier accepted work unless the new phase directly depends on it.
 
 ---
 
@@ -117,6 +173,7 @@ Non-negotiable rules:
 - Do not claim unsupported capabilities as supported.
 - If a feature is best-effort, label it as best-effort.
 - If a behavior differs by TV generation or protocol, surface that honestly in docs and UI where appropriate.
+- Do not allow placeholder UI or scaffold logic to imply real feature parity.
 
 ---
 
@@ -144,6 +201,7 @@ Treat modern and legacy paths separately.
 - Do not assume a capability exists on all generations.
 - Capability gating must remain explicit and truthful.
 - Avoid broad transport rewrites unless explicitly requested.
+- Do not mark transport behavior as validated unless it was checked against a real TV or clearly scoped fake/test harness.
 
 ---
 
@@ -163,6 +221,8 @@ Priorities:
 Do not let default Material styling redefine the product accidentally.
 Use design tokens and controlled styling.
 
+If the current Android UI feels wrong, fix functionality first, then improve the design without losing product meaning.
+
 ---
 
 ## Validation Standard
@@ -178,6 +238,8 @@ For every significant checkpoint, provide:
 Do not claim “fully verified” without real execution evidence.
 
 If validation is local/session-based rather than CI-hosted, state that explicitly.
+
+When real TVs and real devices are available, prefer those over fake placeholders or emulator-only confidence.
 
 ---
 
@@ -195,6 +257,8 @@ When given a task:
 
 Do not jump into broad refactors without first explaining why.
 
+Do not claim completion if important real-device or real-TV validation is still missing.
+
 ---
 
 ## No-Drift Rules
@@ -206,6 +270,7 @@ Do not regress:
 - support-boundary truthfulness
 - Quick Launch wording
 - saved-device / pairing lifecycle clarity
+- ConnectedNotReady vs Ready truthfulness
 
 If docs need to change because behavior changes, update docs in the same phase.
 
@@ -220,3 +285,4 @@ Prefer:
 - narrower scope
 - explicit caveat
 - stronger validation evidence
+- real-device verification over assumption
